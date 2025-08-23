@@ -1,6 +1,6 @@
 {
-  "version": "1.2.3",
-  "versionCode": "20250709",
-  "zipUrl": "https://github.com/misak10/box/releases/download/1.2.3/box_1.2.3.zip",
-  "changelog": "https://github.com/misak10/box/raw/master/CHANGELOG.md"
+  "version": "1.2.4",
+  "versionCode": "20250823",
+  "zipUrl": "https://github.com/boxproxy/box/releases/download/1.2.4/box-1.2.4.zip",
+  "changelog": "https://github.com/boxproxy/box/raw/master/CHANGELOG.md"
 }
