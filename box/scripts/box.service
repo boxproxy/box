@@ -9,33 +9,42 @@ find_packages_uid() {
   local uid_log="${box_run}/uid.log"
 
   : > "${uid_log}"
-  echo "--- Box UID/GID 查询日志 ---" >> "${uid_log}"
-  echo "$(date)" >> "${uid_log}"
-  echo "[Info] 代理模式: ${proxy_mode}" >> "${uid_log}"
-  echo "" >> "${uid_log}"
-  echo "--- 从 package.list.cfg 读取的列表 ---" >> "${uid_log}"
-  echo "[Debug] 统一应用列表: ${packages_list[*]}" >> "${uid_log}"
-  echo "[Debug] GID 列表: ${gid_list[*]}" >> "${uid_log}"
+  {
+    echo "--- Box UID/GID 查询日志 ---"
+    date
+    echo "[Info] 代理模式: ${proxy_mode}"
+    echo
+    echo "--- 从 package.list.cfg 读取的列表 ---"
+    echo "[Debug] 统一应用列表: ${packages_list[*]}"
+    echo "[Debug] GID 列表: ${gid_list[*]}"
+    echo
+    echo "--- 处理结果 ---"
+  } >> "${uid_log}"
 
   > "${uid_list}"
 
-  echo "" >> "${uid_log}"
-  echo "--- 处理结果 ---" >> "${uid_log}"
-
+  local tmp_packages="${box_run}/packages.list.tmp"
+  : > "${tmp_packages}"
   for entry in "${packages_list[@]}"; do
-    prefix="${entry%%:*}"
-    package="${entry#*:}"
-    
-    local base_uid
-    base_uid=$(busybox awk -v p="^${package}$" '$1 ~ p {print $2; exit}' "${system_packages_file}")
-    if [ -n "${base_uid}" ]; then
-      local multiuser_uid=$((base_uid + prefix * 100000))
-      echo "${multiuser_uid}" >> "${uid_list}"
-      echo "[Info] Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}" >> "${uid_log}"
-    else
-      echo "[Warning] Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 未找到" >> "${uid_log}"
-    fi
+    printf "%s\n" "${entry}" >> "${tmp_packages}"
   done
+
+  busybox awk -v ULOG="${uid_log}" -v ULIST="${uid_list}" '
+    FNR==NR { pkg2uid[$1]=$2; next }
+    {
+      n=split($0,a,":"); if(n<2) next;
+      prefix=a[1]; pkg=a[2];
+      if (pkg in pkg2uid) {
+        multi=pkg2uid[pkg] + prefix * 100000;
+        print multi >> ULIST;
+        printf("[Info] Success: 用户 \"%s\" 应用: \"%s\" -> %d\n", prefix, pkg, multi) >> ULOG;
+      } else {
+        printf("[Warning] Failure: 用户 \"%s\" 应用: \"%s\" -> 未找到\n", prefix, pkg) >> ULOG;
+      }
+    }
+  ' "${system_packages_file}" "${tmp_packages}"
+
+  rm -f "${tmp_packages}"
 
   if [ ${#gid_list[@]} -gt 0 ]; then
     printf "%s\n" "${gid_list[@]}" >> "${uid_list}"
@@ -55,34 +64,32 @@ log_service_results() {
     local proxy_mode_type="$2"
     local uids="$3"
 
-    echo "" >> "${uid_log}"
-    echo "--- ${core_name} 服务处理结果 ---" >> "${box_run}/uid.log"
-    echo "$(date)" >> "${box_run}/uid.log"
-    echo "[Info] 操作: 更新TUN模式UID列表" >> "${box_run}/uid.log"
-    
-    if [ -n "$uids" ]; then
-        echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
-        echo "[Debug] 应用的 UIDs: ${uids}" >> "${box_run}/uid.log"
-    else
-        echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
-        echo "[Debug] 应用的 UIDs: (无)" >> "${box_run}/uid.log"
-    fi
+    {
+      echo
+      echo "--- ${core_name} 服务处理结果 ---"
+      date
+      echo "[Info] 操作: 更新TUN模式UID列表"
+      echo "[Info] 模式: ${proxy_mode_type}"
+      if [ -n "$uids" ]; then
+        echo "[Debug] 应用的 UIDs: ${uids}"
+      else
+        echo "[Debug] 应用的 UIDs: (无)"
+      fi
+    } >> "${box_run}/uid.log"
 }
 
 box_check_logs() {
-  # 删除所有内核日志并备份
-  log Info "删除并备份日志文件"
-  (
-    for bin in "${bin_list[@]}"; do
-      if [ -f "${box_run}/${bin}.log" ]; then
-        mv "${box_run}/${bin}.log" "${box_run}/${bin}.old.log"
-      fi
+    ts=$(date '+%Y-%m-%d_%H-%M-%S')
+    log Info "删除并备份日志文件"
+    for bin in "${bin_name}"; do
+        log_file="${box_run}/${bin}.log"
+        if [ -f "${log_file}" ]; then
+            mv "${log_file}" "${box_run}/${bin}_$ts.log.bak"
+            log Info "备份: ${bin}.log → ${bin}_${ts}.log.bak"
+        fi
     done
-    # 删除其他日志文件
-    find "${box_run}" -maxdepth 1 -type f \( -name "root" -o \( -name "*.list" -a ! -name "appuid.list" \) -o -name "*.inotify.log" \) -exec rm -f {} +
-    # 删除三天前的日志
-    find "${box_run}" -maxdepth 1 -type f -name "*.log" -mtime +3 -exec rm -f {} +
-  ) &
+    find "${box_run}" -maxdepth 1 -type f \( -name "root" -o -name "*.list" -o -name "*.inotify.log" \) -exec rm -f {} +
+    find "${box_run}" -maxdepth 1 -type f \( -name "*.log" -o -name "*.bak" \) -mtime +1 -exec rm -f {} +
 }
 
 box_bin_alive() {
@@ -104,9 +111,7 @@ box_bin_alive() {
 }
 
 box_run_crontab() {
-  # 停止已运行的 crond（可选）
   pkill -f "busybox crond" >/dev/null 2>&1
-  # 准备 crontab
   busybox crontab -c "${box_run}" -r
   echo "# root 的定时任务" > "${box_run}/root"
 
@@ -122,7 +127,6 @@ box_run_crontab() {
     fi
     cat "${box_dir}/crontab.cfg" >> "${box_run}/root"
     chmod 0644 "${box_run}/root"
-    # 后台启动 crond
     nohup busybox crond -c "${box_run}" >/dev/null 2>&1 &
   else
     log Info "crond 已禁用"
@@ -188,19 +192,6 @@ box_check_bin() {
 
   log Info "${version_output}"
 }
-
-# create_tun_link() {
-  # mkdir -p /dev/net
-  # [ ! -L /dev/net/tun ] && ln -s /dev/tun /dev/net/tun
-
-  # if [ ! -c "/dev/net/tun" ]; then
-      # log Error "Cannot create /dev/net/tun. Possible reasons:"
-      # log Warning "Your system does not support the TUN/TAP driver."
-      # log Warning "Your system kernel version is not compatible with the TUN/TAP driver."
-      # sed -i 's/network_mode=.*/network_mode="tproxy"/g' "${settings}"
-      # exit 1
-  # fi
-# }
 
 prepare_singbox() {
   # 检查配置文件
@@ -660,9 +651,8 @@ box_bin_status() {
   fi
 }
 
-# ========== 新增 set_description 函数 ===========
 set_description() {
-  local status="$1" # running, stopped, idle
+  local status="$1"
   local error_msg="$2"
   local desc=""
   local ipv6_info=""
@@ -808,7 +798,6 @@ start_box() {
     log Info "当前 $(which busybox) v${busybox_code}"
   fi
 
-  # 检查权限，检查内核是否存在，删除旧日志，如有必要创建 TUN，运行内核，等待 1 秒
   box_permission
   box_check_bin
   box_check_logs

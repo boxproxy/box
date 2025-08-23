@@ -31,49 +31,43 @@ fi
 
 source "${scripts_dir}/ctr.utils"
 
-service_script="${scripts_dir}/box.service"
-iptables_script="${scripts_dir}/box.iptables"
-
 log_msg() {
-    if [ "$inotify_log_enabled" = "true" ]; then
-        if [ -z "$1" ]; then
-            echo "" >> "$log_file"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$log_file"
-        fi
+  if [ "$inotify_log_enabled" = "true" ]; then
+    if [ -z "$1" ]; then
+      echo "" >> "$log_file"
+    else
+      echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$log_file"
     fi
+  fi
 }
 
 clean_old_logs() {
-    # 只保留过去24小时的日志
-    local retention_seconds=86400 # 24 hours
-    local cutoff_time=$(( $(date +%s) - retention_seconds ))
-    local cutoff_str
-    cutoff_str=$(date -d "@${cutoff_time}" '+%Y-%m-%d %H:%M:%S')
+  local retention_seconds=86400
+  local cutoff_time=$(( $(date +%s) - retention_seconds ))
+  local cutoff_str
+  cutoff_str=$(date -d "@${cutoff_time}" '+%Y-%m-%d %H:%M:%S')
 
-    if [ -f "$log_file" ]; then
-        # 使用 awk 高效地过滤旧日志.
-        # 保留比 cutoff_str 时间更新的日志行, 以及非日志格式的行 (如空行).
-        awk -v cutoff="$cutoff_str" '
-            !/^[0-9]{4}-[0-9]{2}-[0-9]{2}/ {print; next}
-            substr($0, 1, 19) >= cutoff {print}
-        ' "$log_file" > "$temp_log_file" && mv "$temp_log_file" "$log_file"
-    fi
+  if [ -f "$log_file" ]; then
+    busybox awk -v cutoff="$cutoff_str" '
+      !/^[0-9]{4}-[0-9]{2}-[0-9]{2}/ {print; next}
+      substr($0, 1, 19) >= cutoff {print}
+  ' "$log_file" > "$temp_log_file" && mv "$temp_log_file" "$log_file"
+  fi
 }
 clean_old_logs
 
 current_time=$(date +%s)
 last_check_time=0
 if [ -f "$last_check_file" ]; then
-    last_check_time=$(cat "$last_check_file")
+  last_check_time=$(cat "$last_check_file")
 fi
 
 time_diff=$((current_time - last_check_time))
 stability_window=3
 
 if [ "$time_diff" -lt "$stability_window" ]; then
-    log_msg "Skip check:（${time_diff}秒），进入稳定性窗口"
-    return
+  log_msg "跳过检查：(${time_diff}秒)，处于稳定窗口内"
+  return
 fi
 
 echo "$current_time" > "$last_check_file"
@@ -82,161 +76,151 @@ wifi_status=$(is_wifi_connected)
 ssid=$(get_current_ssid)
 
 get_current_ip() {
-    ip addr show wlan0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1
+  ip addr show wlan0 | grep 'inet ' | busybox awk '{print $2}' | cut -d/ -f1
 }
 
 check_module_service() {
-    if [ "$enable_network_service_control" = "true" ]; then
-        if [ -f "$box_pid" ]; then
-            current_state="enabled"
-        else
-            current_state="disabled"
-        fi
-
-        last_ssid=""
-        last_ip=""
-        if [ -f "$last_wifi_state_file" ]; then
-            last_ssid=$(grep 'ssid:' "$last_wifi_state_file" | cut -d: -f2)
-            last_ip=$(grep 'ip:' "$last_wifi_state_file" | cut -d: -f2)
-        fi
-
-        if [ "$wifi_status" = "wifi" ] && [ -n "$ssid" ]; then
-            for i in {1..3}; do
-                current_ip=$(get_current_ip)
-                if [ -n "$current_ip" ]; then
-                    break
-                fi
-                sleep 2
-            done
-
-            if [ -n "$current_ip" ]; then
-                log_msg "--- 网络状态变化: WiFi已连接 ---"
-                log_msg "SSID: ${ssid}, IP: ${current_ip}"
-                echo "ssid:${ssid}" > "$last_wifi_state_file"
-                echo "ip:${current_ip}" >> "$last_wifi_state_file"
-                
-                if [ "$use_module_on_wifi" = "false" ]; then
-                    log_msg "策略: WiFi环境禁用服务"
-                    if [ "$current_state" != "disabled" ]; then
-                        "$iptables_script" disable
-                        "$service_script" stop
-                        log_msg "操作: 服务已停止"
-                    else
-                        log_msg "状态: 服务已是停止状态, 无需操作"
-                    fi
-                else
-                    if [ "$use_ssid_matching" = "true" ]; then
-                        if [ "$use_wifi_list_mode" = "blacklist" ]; then
-                            # 使用引号和逗号分隔来处理包含空格的SSID
-                            ssid_list_str=""
-                            for ssid_item in "${wifi_ssids_list[@]}"; do
-                                if [ -z "$ssid_list_str" ]; then
-                                    ssid_list_str="'$ssid_item'"
-                                else
-                                    ssid_list_str="$ssid_list_str, '$ssid_item'"
-                                fi
-                            done
-                            log_msg "策略: WiFi黑名单模式, 名单: [$ssid_list_str]"
-                            if is_allowed_wifi "$ssid" "${wifi_ssids_list[@]}"; then
-                                log_msg "结果: ${ssid} 在黑名单中"
-                                if [ "$current_state" != "disabled" ]; then
-                                    "$iptables_script" disable
-                                    "$service_script" stop
-                                    log_msg "操作: 服务已停止"
-                                else
-                                    log_msg "状态: 服务已是停止状态, 无需操作"
-                                fi
-                            else
-                                log_msg "结果: ${ssid} 不在黑名单中"
-                                if [ "$current_state" != "enabled" ]; then
-                                    "$service_script" start
-                                    "$iptables_script" enable
-                                    log_msg "操作: 服务已启动"
-                                else
-                                    log_msg "状态: 服务已是启动状态, 无需操作"
-                                fi
-                            fi
-                        elif [ "$use_wifi_list_mode" = "whitelist" ]; then
-                            # 使用引号和逗号分隔来处理包含空格的SSID
-                            ssid_list_str=""
-                            for ssid_item in "${wifi_ssids_list[@]}"; do
-                                if [ -z "$ssid_list_str" ]; then
-                                    ssid_list_str="'$ssid_item'"
-                                else
-                                    ssid_list_str="$ssid_list_str, '$ssid_item'"
-                                fi
-                            done
-                            log_msg "策略: WiFi白名单模式, 名单: [$ssid_list_str]"
-                            if is_allowed_wifi "$ssid" "${wifi_ssids_list[@]}"; then
-                                log_msg "结果: ${ssid} 在白名单中"
-                                if [ "$current_state" != "enabled" ]; then
-                                    "$service_script" start
-                                    "$iptables_script" enable
-                                    log_msg "操作: 服务已启动"
-                                else
-                                    log_msg "状态: 服务已是启动状态, 无需操作"
-                                fi
-                            else
-                                log_msg "结果: ${ssid} 不在白名单中"
-                                if [ "$current_state" != "disabled" ]; then
-                                    "$iptables_script" disable
-                                    "$service_script" stop
-                                    log_msg "操作: 服务已停止"
-                                else
-                                    log_msg "状态: 服务已是停止状态, 无需操作"
-                                fi
-                            fi
-                        else
-                            log_msg "警告: 未知的WiFi名单模式, 执行默认启动逻辑"
-                            if [ "$current_state" != "enabled" ]; then
-                                "$service_script" start
-                                "$iptables_script" enable
-                                log_msg "操作: 服务已启动"
-                            else
-                                log_msg "状态: 服务已是启动状态, 无需操作"
-                            fi
-                        fi
-                    else
-                        log_msg "策略: WiFi环境默认启动服务"
-                        if [ "$current_state" != "enabled" ]; then
-                            "$service_script" start
-                            "$iptables_script" enable
-                            log_msg "操作: 服务已启动"
-                        else
-                            log_msg "状态: 服务已是启动状态, 无需操作"
-                        fi
-                    fi
-                fi
-            else
-                log_msg "--- 网络状态变化: WiFi连接中 ---"
-                log_msg "状态: 未获取到有效IP地址, 暂不操作"
-            fi
-
-        elif [ "$wifi_status" = "not_wifi" ]; then
-            log_msg "--- 网络状态变化: WiFi已断开 ---"
-            if [ "$use_module_on_wifi_disconnect" = "true" ]; then
-                log_msg "策略: WiFi断开时启动服务"
-                if [ "$current_state" != "enabled" ]; then
-                    "$service_script" start
-                    "$iptables_script" enable
-                    log_msg "操作: 服务已启动"
-                else
-                    log_msg "状态: 服务已是启动状态, 无需操作"
-                fi
-            else
-                log_msg "策略: WiFi断开时禁用服务"
-                if [ "$current_state" != "disabled" ]; then
-                    "$iptables_script" disable
-                    "$service_script" stop
-                    log_msg "操作: 服务已停止"
-                else
-                    log_msg "状态: 服务已是停止状态, 无需操作"
-                fi
-            fi
-        fi
+  if [ "$enable_network_service_control" = "true" ]; then
+    if [ -f "$box_pid" ]; then
+      current_state="enabled"
     else
-        log_msg "网络控制模块服务已停用！"
-        return
+      current_state="disabled"
     fi
+
+    last_ssid=""
+    last_ip=""
+    if [ -f "$last_wifi_state_file" ]; then
+      last_ssid=$(grep 'ssid:' "$last_wifi_state_file" | cut -d: -f2)
+      last_ip=$(grep 'ip:' "$last_wifi_state_file" | cut -d: -f2)
+    fi
+
+    if [ "$wifi_status" = "wifi" ] && [ -n "$ssid" ]; then
+      for i in {1..3}; do
+        current_ip=$(get_current_ip)
+        if [ -n "$current_ip" ]; then
+          break
+        fi
+        sleep 2
+      done
+
+      if [ -n "$current_ip" ]; then
+        echo "-- 日志开始 --" > "$log_file"
+        log_msg "--- 网络状态变化：WiFi 已连接 ---"
+        log_msg "SSID：${ssid}，IP：${current_ip}"
+        echo "ssid:${ssid}" > "$last_wifi_state_file"
+        echo "ip:${current_ip}" >> "$last_wifi_state_file"
+        
+        if [ "$use_module_on_wifi" = "false" ]; then
+          log_msg "策略：WiFi 环境禁用服务"
+          if [ "$current_state" != "disabled" ]; then
+            "${scripts_dir}/box.iptables" disable
+            "${scripts_dir}/box.service" stop
+            log_msg "操作：服务已停止"
+          else
+            log_msg "状态：服务已是停止状态，无需操作"
+          fi
+        else
+          if [ "$use_ssid_matching" = "true" ]; then
+            case "$use_wifi_list_mode" in
+              blacklist)
+                log_msg "策略：WiFi 黑名单模式，名单：${wifi_ssids_list[*]}"
+                if is_allowed_wifi "$ssid" "${ssid_list}"; then
+                  log_msg "结果：${ssid} 在黑名单中"
+                  if [ "$current_state" != "disabled" ]; then
+                    "${scripts_dir}/box.iptables" disable
+                    "${scripts_dir}/box.service" stop
+                    log_msg "操作：服务已停止"
+                  else
+                    log_msg "状态：服务已是停止状态，无需操作"
+                  fi
+                else
+                  log_msg "结果：${ssid} 不在黑名单中"
+                  if [ "$current_state" != "enabled" ]; then
+                    "${scripts_dir}/box.service" start
+                    "${scripts_dir}/box.iptables" enable
+                    log_msg "操作：服务已启动"
+                  else
+                    log_msg "状态：服务已是启动状态，无需操作"
+                  fi
+                fi
+                ;;
+
+              whitelist)
+                log_msg "策略：WiFi 白名单模式，名单：${wifi_ssids_list[*]}"
+                if is_allowed_wifi "$ssid" "${ssid_list}"; then
+                  log_msg "结果：${ssid} 在白名单中"
+                  if [ "$current_state" != "enabled" ]; then
+                    "${scripts_dir}/box.service" start
+                    "${scripts_dir}/box.iptables" enable
+                    log_msg "操作：服务已启动"
+                  else
+                    log_msg "状态：服务已是启动状态，无需操作"
+                  fi
+                else
+                  log_msg "结果：${ssid} 不在白名单中"
+                  if [ "$current_state" != "disabled" ]; then
+                    "${scripts_dir}/box.iptables" disable
+                    "${scripts_dir}/box.service" stop
+                    log_msg "操作：服务已停止"
+                  else
+                    log_msg "状态：服务已是停止状态，无需操作"
+                  fi
+                fi
+                ;;
+
+              *)
+                log_msg "警告：未知的 WiFi 名单模式，采用默认启动逻辑"
+                if [ "$current_state" != "enabled" ]; then
+                  "${scripts_dir}/box.service" start
+                  "${scripts_dir}/box.iptables" enable
+                  log_msg "操作：服务已启动"
+                else
+                  log_msg "状态：服务已是启动状态，无需操作"
+                fi
+                ;;
+            esac
+          else
+            log_msg "策略：WiFi 环境默认启动服务"
+            if [ "$current_state" != "enabled" ]; then
+              "${scripts_dir}/box.service" start
+              "${scripts_dir}/box.iptables" enable
+              log_msg "操作：服务已启动"
+            else
+              log_msg "状态：服务已是启动状态，无需操作"
+            fi
+          fi
+        fi
+      else
+        log_msg "--- 网络状态变化：WiFi 连接中 ---"
+        log_msg "状态：尚未获取到有效 IP 地址，暂不执行操作"
+      fi
+
+    elif [ "$wifi_status" = "not_wifi" ]; then
+      log_msg "--- 网络状态变化：WiFi 已断开 ---"
+      if [ "$use_module_on_wifi_disconnect" = "true" ]; then
+        log_msg "策略：WiFi 断开时启动服务"
+        if [ "$current_state" != "enabled" ]; then
+          "${scripts_dir}/box.service" start
+          "${scripts_dir}/box.iptables" enable
+          log_msg "操作：服务已启动"
+        else
+          log_msg "状态：服务已是启动状态，无需操作"
+        fi
+      else
+        log_msg "策略：WiFi 断开时禁用服务"
+        if [ "$current_state" != "disabled" ]; then
+          "${scripts_dir}/box.iptables" disable
+          "${scripts_dir}/box.service" stop
+          log_msg "操作：服务已停止"
+        else
+          log_msg "状态：服务已是停止状态，无需操作"
+        fi
+      fi
+    fi
+  else
+    log_msg "网络控制模块服务已停用！"
+    return
+  fi
 }
+
 check_module_service

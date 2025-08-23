@@ -629,7 +629,7 @@ cleanup_iptables() {
 
 log_iptables_results() {
   [ "${network_mode}" = "tun" ] && return 0
-  echo "" >> "${uid_log}"
+  echo "" >> "${box_run}/uid.log"
   echo "--- iptables 应用规则摘要 ---" >> "${box_run}/uid.log"
   echo "$(date)" >> "${box_run}/uid.log"
   echo "[Info] 操作: 添加 iptables 规则" >> "${box_run}/uid.log"
@@ -642,15 +642,15 @@ log_iptables_results() {
     echo "[Debug] 应用的 UIDs: $applied_uids" >> "${box_run}/uid.log"
   else
     if [[ "$proxy_mode" == "whitelist" || "$proxy_mode" == "white" ]]; then
-       echo "[Debug] 应用的 UIDs: (列表为空, 代理所有应用)" >> "${box_run}/uid.log"
+       echo "[Debug] 应用的 UIDs: (列表为空, 不处理)" >> "${box_run}/uid.log"
     else
-       echo "[Debug] 应用的 UIDs: (列表为空, 不代理任何应用)" >> "${box_run}/uid.log"
+       echo "[Debug] 应用的 UIDs: (列表为空, 不处理)" >> "${box_run}/uid.log"
     fi
   fi
 }
 
 log_iptables_cleanup() {
-  echo "" >> "${uid_log}"
+  echo "" >> "${box_run}/uid.log"
   echo "--- iptables 处理结果 ---" >> "${box_run}/uid.log"
   echo "$(date)" >> "${box_run}/uid.log"
   echo "[Info] 操作: 清理 iptables 规则" >> "${box_run}/uid.log"
