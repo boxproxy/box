@@ -25,6 +25,11 @@ if which curl >/dev/null; then
   rev1="curl --insecure -sL"
 fi
 
+mask_url() {
+  local u="$1"
+  echo "$u" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)?([^/]+).*$#\1\2/***#'
+}
+
 # 启动提示
 divider() {
   local line="----------------------------------------"
@@ -55,7 +60,11 @@ upfile() {
     update_url="${url_ghproxy}/${update_url}"
   fi
   
-  log Info "开始下载: ${update_url}"
+  log_url="${update_url}"
+  if [ "${LOG_MASK_URL}" = "mask" ]; then
+    log_url="$(mask_url "${update_url}")"
+  fi
+  log Info "开始下载: ${log_url}"
   log Debug "保存到: ${file}"
   log Debug "使用 User-Agent: ${current_ua}"
 
@@ -355,7 +364,7 @@ upsubs() {
       local file_count=${#name_provide_mihomo_config[@]}
 
       if [ "$url_count" -eq 0 ]; then
-        log Warning "${bin_name} 订阅链接为空 (subscription_url_mihomo is empty)"
+        log Warning "${bin_name} 订阅链接为空"
         return 1
       fi
 
@@ -364,8 +373,6 @@ upsubs() {
         return 1
       fi
 
-
-      
       log Info "${bin_name} 开始更新 ${url_count} 个订阅 → $(date)"
       
       if [ -z "${mihomo_provide_path}" ] || ! mkdir -p "${mihomo_provide_path}"; then
@@ -386,7 +393,7 @@ upsubs() {
 
         if [ "${renew}" = "true" ] && [ "$i" -eq 0 ]; then
           log Info "检测到 renew=true, 仅使用第一个订阅链接更新"
-          if upfile "${mihomo_config}" "${url}" "ClashMeta"; then
+          if LOG_MASK_URL=mask upfile "${mihomo_config}" "${url}" "ClashMeta"; then
             log Info "${mihomo_config} 更新成功"
             if [ -f "${box_pid}" ]; then
               kill -0 "$(<"${box_pid}" 2>/dev/null)" && \
@@ -400,16 +407,21 @@ upsubs() {
           fi
         fi
         
-        if upfile "${provider_file}" "${url}" "ClashMeta"; then
+        if LOG_MASK_URL=mask upfile "${provider_file}" "${url}" "ClashMeta"; then
+          log Debug "文件大小: $(wc -c < "${provider_file}" 2>/dev/null || echo "未知") 字节"
+          log Debug "文件路径: ${provider_file}"
+          
           local decoded_content
           decoded_content=$(base64 -d "${provider_file}" 2>/dev/null)
 
-          if [ $? -eq 0 ] && echo "${decoded_content}" | grep -qE "vless://|vmess://|ss://|hysteria://|trojan://"; then
+          if [ $? -eq 0 ] && echo "${decoded_content}" | grep -qE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://"; then
             log Info "检测到 Base64 编码订阅, 正在解码..."
             echo "${decoded_content}" > "${provider_file}"
+            local proxy_count=$(echo "${decoded_content}" | grep -cE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://")
+            log Debug "提取到 ${proxy_count} 个代理节点"
             log Info "订阅 #${i} (Base64解码/原始链接) 已保存"
             success_count=$((success_count + 1))
-          elif ${yq} 'has("proxies")' "${provider_file}" &>/dev/null; then
+          elif ${yq} 'has("proxies")' "${provider_file}" 2>/dev/null; then
             if [ "${custom_rules_subs}" = "true" ] && [ "$rules_extracted" = "false" ]; then
               if ${yq} 'has("rules")' "${provider_file}" &>/dev/null; then
                 log Info "在 ${file_name} 中找到规则, 正在提取..."
@@ -423,14 +435,31 @@ upsubs() {
             log Debug "标准订阅格式, 正在提取 proxies 并覆盖原文件..."
             local temp_proxies_file
             temp_proxies_file=$(mktemp)
-            ${yq} '.proxies' "${provider_file}" > "${temp_proxies_file}"
-            ${yq} -i '{"proxies": .}' "${temp_proxies_file}"
-            mv "${temp_proxies_file}" "${provider_file}"
+            
+            # 提取 proxies 数组并验证
+            log Debug "尝试提取 proxies 字段..."
+            if ${yq} '.proxies' "${provider_file}" > "${temp_proxies_file}" 2>/dev/null; then
+              if [ -s "${temp_proxies_file}" ]; then
+                local proxy_count=$(${yq} 'length' "${temp_proxies_file}" 2>/dev/null || echo "0")
+                log Debug "提取到 ${proxy_count} 个代理节点"
+                ${yq} -i '{"proxies": .}' "${temp_proxies_file}"
+                mv "${temp_proxies_file}" "${provider_file}"
+                log Info "订阅 #${i} (标准格式) 已处理并保存"
+                success_count=$((success_count + 1))
+              else
+                log Error "订阅 #${i} (${file_name}) proxies 字段为空"
+                rm -f "${temp_proxies_file}" "${provider_file}"
+                update_failed=true
+              fi
+            else
+              log Error "订阅 #${i} (${file_name}) yq 提取 proxies 失败"
+              rm -f "${temp_proxies_file}" "${provider_file}"
+              update_failed=true
+            fi
 
-            log Info "订阅 #${i} (标准格式) 已处理并保存"
-            success_count=$((success_count + 1))
-
-          elif ${yq} '.. | select(tag == "!!str")' "${provider_file}" | grep -qE "vless://|vmess://|ss://|hysteria://|trojan://"; then
+          elif ${yq} '.. | select(tag == "!!str")' "${provider_file}" 2>/dev/null | grep -qE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://"; then
+            local proxy_count=$(${yq} '.. | select(tag == "!!str")' "${provider_file}" 2>/dev/null | grep -cE "vless://|vmess://|ss://|hysteria://|hysteria2://|anytls://|trojan://")
+            log Debug "提取到 ${proxy_count} 个代理节点"
             log Info "订阅 #${i} (原始链接) 已保存"
             success_count=$((success_count + 1))
           else

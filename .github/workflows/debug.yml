@@ -88,7 +88,7 @@ jobs:
           COMMIT_DATE=$(git log -1 --pretty=format:"%ad" --date=short)
           
           # Escape HTML special characters for Telegram HTML parse mode
-          COMMIT_MSG_ESCAPED=$(echo "$COMMIT_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          COMMIT_MSG_ESCAPED=$(echo "$COMMIT_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/`\([^`]*\)`/<code>\1<\/code>/g')
           COMMIT_AUTHOR_ESCAPED=$(echo "$COMMIT_AUTHOR" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
           
           # Use EOF delimiter for multiline output
@@ -128,8 +128,10 @@ jobs:
           <b>日期:</b> ${{ steps.commit_info.outputs.commit_date }}
           <b>内容:</b> ${{ steps.commit_info.outputs.commit_msg }}
           
-          <a href='https://github.com/boxproxy/box'>仓库地址</a> | <a href='https://github.com/boxproxy/box/actions/runs/${{ github.run_id }}'>构建详情</a>"
-          
+          <a href='https://github.com/boxproxy/box'>仓库地址</a> | <a href='https://github.com/boxproxy/box/actions/runs/${{ github.run_id }}'>构建详情</a> | <a href='https://afdian.com/a/boxproxy'>随缘打赏</a>
+
+          #模块更新"
+
           curl -sS -f -F "chat_id=$TG_CHAT_ID" \
                -F "document=@${{ steps.get_version.outputs.artifact_name }}.zip" \
                -F "caption=$MESSAGE" \

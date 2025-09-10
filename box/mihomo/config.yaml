@@ -1,37 +1,31 @@
-pr: &pr
-  proxies: [主要节点, 手动切换, 自动选择, 故障转移组, 自动选择_香港, 自动选择_台湾, 自动选择_新加坡, 自动选择_日本, 自动选择_美国, 国内直连, REJECT]
-
-p: &p
-  type: http
-  interval: 86400
-  health-check:
-    enable: true
-    url: https://cp.cloudflare.com
-    interval: 300
-    timeout: 1000
-    tolerance: 100
-
 proxy-anchor:
-  use: &use
-    use: [proxy1]
-  
   select_use: &select_use
     type: select
-    <<: *use
+    include-all: true
+    exclude-type: "dns"
+  
+  auto_use: &auto_use
+    type: url-test
+    include-all: true
+    exclude-type: "dns"
 
   select_proxy: &select_proxy
     type: select
-    <<: *pr
+    proxies: [主要节点, 手动切换, 自动选择, 故障转移组, 手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国, 国内直连, 广告拦截]
 
-  auto_use: &auto_use
-    type: url-test
-    <<: *use
+  test_proxy: &test_proxy
+    type: file
+    health-check:
+      enable: true
+      url: https://cp.cloudflare.com
+      interval: 300
+      timeout: 1000
+      tolerance: 100
 
 proxy-providers:
   proxy1:
-    <<: *p
+    <<: *test_proxy
     path: ./proxy_provider/proxy1.yaml
-    url: "此处填写订阅链接"
 
 mixed-port: 7890
 redir-port: 9797
@@ -48,7 +42,6 @@ global-client-fingerprint: random
 external-controller: 0.0.0.0:9090
 secret: ""
 external-ui: ./dashboard
-external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
 
 profile:
   store-selected: true
@@ -73,9 +66,9 @@ tun:
   dns-hijack: [any:53, tcp://any:53]
   udp-timeout: 300
   auto-route: true
-  auto-redirect: true
+  auto-redirect: false
   auto-detect-interface: true
-  strict-route: true
+  strict-route: false
 
 dns:
   enable: true
@@ -93,8 +86,6 @@ dns:
     "rule-set:cn_domain":
       - https://dns.alidns.com/dns-query
       - https://doh.pub/dns-query
-    "rule-set:private_domain":
-      - system
     "rule-set:awavenue":
       - rcode://success
   nameserver:
@@ -144,6 +135,8 @@ proxy-groups:
   - name: 国内直连
     type: select
     proxies: [DIRECT, REJECT]
+    include-all: true
+    exclude-type: "dns"
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/China.png
 
   - name: DNS
@@ -161,7 +154,7 @@ proxy-groups:
 
   - name: 主要节点
     type: select
-    proxies: [自动选择, 手动切换, 故障转移组, 自动选择_香港, 自动选择_台湾, 自动选择_新加坡, 自动选择_日本, 自动选择_美国, 国内直连, REJECT]
+    proxies: [手动切换, 自动选择, 故障转移组, 手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国, 国内直连, 广告拦截]
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Star.png
 
   - name: 手动切换
@@ -170,32 +163,32 @@ proxy-groups:
 
   - name: 故障转移组
     type: fallback
-    proxies: [自动选择_香港, 自动选择_台湾, 自动选择_新加坡, 自动选择_日本, 自动选择_美国]
+    proxies: [手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国]
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Back.png
 
-  - name: 自动选择_香港
-    <<: *auto_use
-    filter: "(?i)(香港|hong kong|hk|hksar)"
+  - name: 手动选择_香港
+    <<: *select_use
+    filter: "(?i)(🇭🇰|香港|hong kong|hk|hksar)"
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Hong_Kong.png
 
-  - name: 自动选择_台湾
-    <<: *auto_use
-    filter: "(?i)(台湾|taiwan|tw|twn|台北|taipei|高雄|kaohsiung|台中|taichung|新北|new taipei)"
+  - name: 手动选择_台湾
+    <<: *select_use
+    filter: "(?i)(🇹🇼|台湾|taiwan|tw|twn|台北|taipei|高雄|kaohsiung|台中|taichung|新北|new taipei)"
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Taiwan.png
 
-  - name: 自动选择_新加坡
-    <<: *auto_use
-    filter: "(?i)(新加坡|狮城|singapore|sg|sgp)"
+  - name: 手动选择_新加坡
+    <<: *select_use
+    filter: "(?i)(🇸🇬|新加坡|狮城|singapore|sg|sgp)"
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Singapore.png
 
-  - name: 自动选择_日本
-    <<: *auto_use
-    filter: "(?i)(日本|japan|jpn|jp|tokyo|大阪|osaka|京都|kyoto|福冈|fukuoka|札幌|sapporo|名古屋|nagoya)"
+  - name: 手动选择_日本
+    <<: *select_use
+    filter: "(?i)(🇹🇼|日本|japan|jpn|jp|tokyo|大阪|osaka|京都|kyoto|福冈|fukuoka|札幌|sapporo|名古屋|nagoya)"
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Japan.png
 
-  - name: 自动选择_美国
-    <<: *auto_use
-    filter: "(?i)(美国|united states|usa|us|america|加州|california|纽约|new york|德克萨斯|texas|佛罗里达|florida|华盛顿|washington|芝加哥|chicago|洛杉矶|los angeles|旧金山|san francisco)"
+  - name: 手动选择_美国
+    <<: *select_use
+    filter: "(?i)(🇺🇸|美国|united states|usa|us|america|加州|california|纽约|new york|德克萨斯|texas|佛罗里达|florida|华盛顿|washington|芝加哥|chicago|洛杉矶|los angeles|旧金山|san francisco)"
     icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/United_States.png
 
   - name: 自动选择
@@ -289,12 +282,8 @@ rule-providers:
   
 rules:
   - DST-PORT,53,DNS_Hijack
-  - DST-PORT,5228,FCM推送
-  - DOMAIN-REGEX,^.*mtalk.google.com,FCM推送
-  - DOMAIN-SUFFIX,linux.do,国外代理
-  - DOMAIN-SUFFIX,akikawa.asia,国内直连
   - DOMAIN-SUFFIX,omarea.com,国外代理
-  - DOMAIN-SUFFIX,parkson-market.org,国内直连
+  - OR,((DST-PORT,5228),(DOMAIN-REGEX,^.*mtalk.google.com)),FCM推送
   - RULE-SET,Ai,Ai
   - OR,((RULE-SET,netflix_ip,no-resolve),(RULE-SET,netflix_domain)),奈飞视频
   - OR,((RULE-SET,telegram_ip,no-resolve),(RULE-SET,telegram_domain)),电报消息

@@ -223,6 +223,29 @@ if [ "${backup_box}" = "true" ]; then
   ui_print " "
   ui_print "- 正在恢复用户配置和数据..."
 
+  if [ -f "${temp_dir}/settings.ini" ]; then
+    if [ -f "/data/adb/box/settings.ini" ]; then
+      if handle_choice "检测到旧的 settings.ini，选择如何处理？" "覆盖（使用新版覆盖旧版）" "增量合并（仅把旧值写入新版已有键）"; then
+        ui_print "  - 已选择使用新版 settings.ini（不应用旧版设置）"
+      else
+        mv /data/adb/box/settings.ini /data/adb/box/settings.ini.new
+        grep -E '^[a-zA-Z0-9_]+=' "${temp_dir}/settings.ini" | while IFS='=' read -r key value; do
+          [ -z "${key}" ] && continue
+          echo "${key}" | grep -qE '^[a-zA-Z0-9_]+' || continue
+          if grep -q -E "^${key}=" "/data/adb/box/settings.ini.new"; then
+            escaped_value=$(printf '%s' "${value}" | sed -e 's/[&\\#]/\\&/g')
+            sed -i "s#^${key}=.*#${key}=${escaped_value}#" "/data/adb/box/settings.ini.new"
+          fi
+        done
+        mv /data/adb/box/settings.ini.new /data/adb/box/settings.ini
+        ui_print "  - 已将用户自定义项增量合并至新版 settings.ini"
+      fi
+    else
+      cp -f "${temp_dir}/settings.ini" "/data/adb/box/settings.ini"
+      ui_print "  - 已恢复 settings.ini"
+    fi
+  fi
+
   restore_config_dir() {
     config_dir="$1"
     if [ -d "${temp_dir}/${config_dir}" ]; then
@@ -250,6 +273,7 @@ if [ "${backup_box}" = "true" ]; then
       ui_print "  - 恢复二进制文件: ${bin_path_fragment}"
       mkdir -p "$(dirname "${target_path}")"
       cp -f "${backup_path}" "${target_path}"
+      chmod 755 "${target_path}"
     fi
   }
   for bin_item in curl yq xray sing-box v2fly hysteria mihomo; do
