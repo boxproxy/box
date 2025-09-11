@@ -69,7 +69,7 @@ upfile() {
   log Debug "使用 User-Agent: ${current_ua}"
 
   if which curl >/dev/null; then
-    http_code=$(curl -L -s --insecure --user-agent "${current_ua}" -o "${file}" -w "%{http_code}" "${update_url}")
+    http_code=$(curl -L -s --insecure --http1.1 --compressed --user-agent "${current_ua}" -o "${file}" -w "%{http_code}" "${update_url}")
     curl_exit_code=$?
 
     if [ ${curl_exit_code} -ne 0 ]; then
@@ -437,7 +437,7 @@ upsubs() {
             temp_proxies_file=$(mktemp)
             
             # 提取 proxies 数组并验证
-            log Debug "尝试提取 proxies 字段..."
+            log Debug "尝试提取 proxies 字段..."     
             if ${yq} '.proxies' "${provider_file}" > "${temp_proxies_file}" 2>/dev/null; then
               if [ -s "${temp_proxies_file}" ]; then
                 local proxy_count=$(${yq} 'length' "${temp_proxies_file}" 2>/dev/null || echo "0")
