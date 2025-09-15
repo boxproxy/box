@@ -128,7 +128,7 @@ jobs:
           <b>日期:</b> ${{ steps.commit_info.outputs.commit_date }}
           <b>内容:</b> ${{ steps.commit_info.outputs.commit_msg }}
           
-          <a href='https://github.com/boxproxy/box'>仓库地址</a> | <a href='https://github.com/boxproxy/box/actions/runs/${{ github.run_id }}'>构建详情</a> | <a href='https://afdian.com/a/boxproxy'>随缘打赏</a>
+          <a href='https://github.com/boxproxy/box'>仓库地址</a> | <a href='https://github.com/boxproxy/box/actions/runs/${{ github.run_id }}'>构建详情</a>
 
           #模块更新"
 

@@ -6,16 +6,17 @@ scripts_dir="${0%/*}"
 user_agent="box_for_root"
 # 是否使用 ghfast 加速 GitHub 下载
 url_ghproxy="https://ghfast.top"
-use_ghproxy="false"
 # 启用/禁用下载稳定的 mihomo 内核
 mihomo_stable="enable"
 singbox_stable="enable"
+
+# GitHub 访问令牌（可选）
+githubtoken=""
 
 # 这会覆盖上面设置的默认值
 source /data/adb/box/settings.ini
 
 # 使用 settings.ini 中提供的 log()
-
 TOOL_LOG="/data/adb/box/run/tool.log"
 busybox mkdir -p "$(dirname "$TOOL_LOG")"
 box_log="$TOOL_LOG"
@@ -23,6 +24,16 @@ box_log="$TOOL_LOG"
 rev1="busybox wget --no-check-certificate -qO-"
 if which curl >/dev/null; then
   rev1="curl --insecure -sL"
+fi
+if [ -n "$githubtoken" ]; then
+  if which curl >/dev/null; then
+    rev1="curl --insecure -sL -H \"Authorization: token ${githubtoken}\""
+  else
+    rev1="busybox wget --no-check-certificate -qO- --header=\"Authorization: token ${githubtoken}\""
+  fi
+  log Debug "GitHub Token 已配置，将使用认证访问 GitHub API（不显示 Token）"
+else
+  log Debug "未配置 GitHub Token，将使用匿名访问 GitHub API"
 fi
 
 mask_url() {
@@ -603,6 +614,11 @@ upkernel() {
         latest_version=$($rev1 "${download_link}/expanded_assets/${tag}" | busybox grep -oE "alpha-[0-9a-z]+" | head -1)
       fi
 
+      if [ -z "$latest_version" ]; then
+        log Error "获取 mihomo 最新 稳定版/预发行版 失败"
+        return 1
+      fi
+
       local extension="gz"
       if [ "${platform}" = "android" ]; then
         extension="zip"
@@ -616,6 +632,11 @@ upkernel() {
       [ "${core_to_update}" = "xray" ] && bin='Xray' || bin='v2ray'
       api_url="https://api.github.com/repos/$(if [ "${core_to_update}" = "xray" ]; then echo "XTLS/Xray-core/releases"; else echo "v2fly/v2ray-core/releases"; fi)"
       latest_version=$($rev1 ${api_url} | grep "tag_name" | busybox grep -oE "v[0-9.]*" | head -1)
+
+      if [ -z "$latest_version" ]; then
+        log Error "获取 ${core_to_update} 最新版本号失败"
+        return 1
+      fi
 
       case $(uname -m) in
         "i386") download_file="$bin-linux-32.zip" ;;
@@ -645,6 +666,11 @@ upkernel() {
         cp "${bin_dir}/hysteria" "${bin_dir}/backup/hysteria.bak" >/dev/null 2>&1
       fi
       local latest_version=$($rev1 "https://api.github.com/repos/apernet/hysteria/releases" | grep "tag_name" | grep -oE "[0-9.].*" | head -1 | sed 's/,//g' | cut -d '"' -f 1)
+
+      if [ -z "$latest_version" ]; then
+        log Error "获取 hysteria 最新版本号失败"
+        return 1
+      fi
 
       local download_link="https://github.com/apernet/hysteria/releases/download/app%2Fv${latest_version}/hysteria-android-${arch}"
 

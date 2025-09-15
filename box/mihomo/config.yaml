@@ -98,102 +98,102 @@ proxies:
 proxy-groups:
   - name: Ai
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/AI.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/AI.png
 
   - name: FCM推送
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Mail.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Mail.png
 
   - name: 谷歌服务
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Google_Search.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Google_Search.png
 
   - name: 微软服务
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Microsoft.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Microsoft.png
 
   - name: GITHUB
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/GitHub.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/GitHub.png
 
   - name: 油管视频
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/YouTube.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/YouTube.png
 
   - name: 奈飞视频
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Netflix.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Netflix.png
 
   - name: 电报消息
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Telegram.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Telegram.png
 
   - name: 国外代理
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Proxy.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Proxy.png
 
   - name: 国内直连
     type: select
     proxies: [DIRECT, REJECT]
     include-all: true
     exclude-type: "dns"
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/China.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/China.png
 
   - name: DNS
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Domestic.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Domestic.png
 
   - name: 广告拦截
     type: select
     proxies: [REJECT, 国内直连, REJECT-DROP, PASS]
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Reject.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Reject.png
 
   - name: 漏网之鱼
     <<: *select_proxy
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Final.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Final.png
 
   - name: 主要节点
     type: select
     proxies: [手动切换, 自动选择, 故障转移组, 手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国, 国内直连, 广告拦截]
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Star.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Star.png
 
   - name: 手动切换
     <<: *select_use
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Rocket.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Rocket.png
 
   - name: 故障转移组
     type: fallback
     proxies: [手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国]
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Back.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Back.png
 
   - name: 手动选择_香港
     <<: *select_use
     filter: "(?i)(🇭🇰|香港|hong kong|hk|hksar)"
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Hong_Kong.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Hong_Kong.png
 
   - name: 手动选择_台湾
     <<: *select_use
     filter: "(?i)(🇹🇼|台湾|taiwan|tw|twn|台北|taipei|高雄|kaohsiung|台中|taichung|新北|new taipei)"
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Taiwan.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Taiwan.png
 
   - name: 手动选择_新加坡
     <<: *select_use
     filter: "(?i)(🇸🇬|新加坡|狮城|singapore|sg|sgp)"
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Singapore.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Singapore.png
 
   - name: 手动选择_日本
     <<: *select_use
     filter: "(?i)(🇹🇼|日本|japan|jpn|jp|tokyo|大阪|osaka|京都|kyoto|福冈|fukuoka|札幌|sapporo|名古屋|nagoya)"
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Japan.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Japan.png
 
   - name: 手动选择_美国
     <<: *select_use
     filter: "(?i)(🇺🇸|美国|united states|usa|us|america|加州|california|纽约|new york|德克萨斯|texas|佛罗里达|florida|华盛顿|washington|芝加哥|chicago|洛杉矶|los angeles|旧金山|san francisco)"
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/United_States.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/United_States.png
 
   - name: 自动选择
     <<: *auto_use
-    icon: https://gitlab.com/akikawa/backup/-/raw/main/IconSet/Color/Auto.png
+    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Auto.png
 
 rule-anchor:
   classical: &classical
