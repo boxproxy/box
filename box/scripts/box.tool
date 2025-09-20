@@ -10,9 +10,6 @@ url_ghproxy="https://ghfast.top"
 mihomo_stable="enable"
 singbox_stable="enable"
 
-# GitHub 访问令牌（可选）
-githubtoken=""
-
 # 这会覆盖上面设置的默认值
 source /data/adb/box/settings.ini
 
@@ -21,20 +18,23 @@ TOOL_LOG="/data/adb/box/run/tool.log"
 busybox mkdir -p "$(dirname "$TOOL_LOG")"
 box_log="$TOOL_LOG"
 
-rev1="busybox wget --no-check-certificate -qO-"
-if which curl >/dev/null; then
-  rev1="curl --insecure -sL"
-fi
-if [ -n "$githubtoken" ]; then
+# 设置 GitHub API 访问配置
+setup_github_api() {
+  rev1="busybox wget --no-check-certificate -qO-"
   if which curl >/dev/null; then
-    rev1="curl --insecure -sL -H \"Authorization: token ${githubtoken}\""
-  else
-    rev1="busybox wget --no-check-certificate -qO- --header=\"Authorization: token ${githubtoken}\""
+    rev1="curl --insecure -sL"
   fi
-  log Debug "GitHub Token 已配置，将使用认证访问 GitHub API（不显示 Token）"
-else
-  log Debug "未配置 GitHub Token，将使用匿名访问 GitHub API"
-fi
+  if [ -n "$githubtoken" ]; then
+    if which curl >/dev/null; then
+      rev1="curl --insecure -sL -H \"Authorization: token ${githubtoken}\""
+    else
+      rev1="busybox wget --no-check-certificate -qO- --header=\"Authorization: token ${githubtoken}\""
+    fi
+    log Debug "GitHub Token 已配置，将使用认证访问 GitHub API"
+  else
+    log Debug "未配置 GitHub Token，将使用匿名访问 GitHub API"
+  fi
+}
 
 mask_url() {
   local u="$1"
@@ -236,6 +236,8 @@ reload() {
 
 # 获取最新的 curl
 upcurl() {
+  setup_github_api
+  
   local arch
   case $(uname -m) in
     "aarch64") arch="aarch64" ;;
@@ -528,6 +530,8 @@ upsubs() {
 }
 
 upkernel() {
+  setup_github_api
+  
   local core_to_update="$1"
   if [ -z "$core_to_update" ]; then
     log Error "upkernel: 未提供核心名称"
@@ -848,34 +852,54 @@ cgroup_blkio() {
   fi
 
   local PID=$(<"$pid_file" 2>/dev/null)
-  if [ -z "$PID" ] || ! kill -0 "$PID" >/dev/null; then
-    log Warning "PID 无效或已停止: $PID"
+  if [ -z "$PID" ] || ! kill -0 "$PID" >/dev/null 2>&1; then
+    log Warning "来自 ${pid_file} 的 PID $PID 无效或未运行"
     return 1
   fi
 
   if [ -z "$blkio_path" ]; then
-    blkio_path=$(mount | busybox awk '/blkio/ {print $3}' | head -1)
+    blkio_path=$(mount | grep cgroup | busybox awk '/blkio/{print $3}' | head -1)
     if [ -z "$blkio_path" ] || [ ! -d "$blkio_path" ]; then
-      log Warning "blkio_path 未找到"
+      log Warning "blkio cgroup 路径未找到"
       return 1
     fi
   fi
 
-  local target
-  if [ -d "${blkio_path}/foreground" ]; then
-    target="${blkio_path}/foreground"
-    log Info "使用已存在的 blkio 组: foreground"
-  else
-    target="${blkio_path}/box"
-    mkdir -p "$target"
-    echo "$fallback_weight" > "${target}/blkio.weight"
-    log Info "已创建 blkio 组: box, 权重 $fallback_weight"
+  local target="${blkio_path}/box"
+  
+  if [ ! -d "$target" ]; then
+    mkdir -p "$target" 2>/dev/null
+    if [ ! -d "$target" ]; then
+      log Warning "无法创建 box blkio 目录: $target"
+      if [ -d "${blkio_path}/foreground" ]; then
+        target="${blkio_path}/foreground"
+        log Info "回退使用现有 blkio 目录: foreground"
+      elif [ -d "${blkio_path}/top-app" ]; then
+        target="${blkio_path}/top-app"
+        log Info "回退使用现有 blkio 目录: top-app"
+      else
+        log Warning "blkio 目标未找到，无法设置 IO 权重"
+        return 1
+      fi
+    else
+      log Info "成功创建专用 box blkio 目录: $target"
+      echo "$fallback_weight" > "${target}/blkio.weight" 2>/dev/null
+      if [ $? -ne 0 ]; then
+        log Warning "无法设置 blkio 权重到 ${target}/blkio.weight"
+      else
+        log Info "已设置 blkio 权重: $fallback_weight"
+      fi
+    fi
   fi
 
-  echo "$PID" > "${target}/cgroup.procs" \
-    && log Info "已分配 PID $PID 到 $target"
-
-  return 0
+  echo "$PID" > "${target}/cgroup.procs" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    log Info "已分配 PID $PID 到 ${target}，IO 权重 [$fallback_weight]"
+    return 0
+  else
+    log Warning "无法将 PID $PID 分配到 ${target}"
+    return 1
+  fi
 }
 
 cgroup_memcg() {
@@ -914,24 +938,39 @@ cgroup_memcg() {
 
   local PID
   PID=$(<"$pid_file" 2>/dev/null)
-  if [ -z "$PID" ] || ! kill -0 "$PID" >/dev/null; then
-    log Warning "PID 无效或已停止: $PID"
+  if [ -z "$PID" ] || ! kill -0 "$PID" >/dev/null 2>&1; then
+    log Warning "来自 ${pid_file} 的 PID $PID 无效或未运行"
     return 1
   fi
 
   if [ -z "$memcg_path" ]; then
     memcg_path=$(mount | grep cgroup | busybox awk '/memory/{print $3}' | head -1)
     if [ -z "$memcg_path" ] || [ ! -d "$memcg_path" ]; then
-      log Warning "无法确定 memcg 路径"
+      log Warning "memory cgroup 路径未找到"
       return 1
     fi
   fi
 
-  local name="${bin_name:-app}"
-  local target="${memcg_path}/${name}"
-  mkdir -p "$target"
+  local target="${memcg_path}/box"
+  
+  if [ ! -d "$target" ]; then
+    mkdir -p "$target" 2>/dev/null
+    if [ ! -d "$target" ]; then
+      log Warning "无法创建 box memory 目录: $target"
+      local name="${bin_name:-app}"
+      target="${memcg_path}/${name}"
+      mkdir -p "$target" 2>/dev/null
+      if [ ! -d "$target" ]; then
+        log Warning "无法创建 memory 目录: $target"
+        return 1
+      fi
+      log Info "回退使用 memory 目录: $target"
+    else
+      log Info "成功创建专用 box memory 目录: $target"
+    fi
+  fi
 
-  hr_limit="$limit B"
+  local hr_limit="$limit B"
   if [ "$limit" -ge 1073741824 ]; then
     hr_limit="$(busybox awk -v b=$limit 'BEGIN{printf "%.2f GiB", b/1073741824}')"
   elif [ "$limit" -ge 1048576 ]; then
@@ -940,13 +979,21 @@ cgroup_memcg() {
     hr_limit="$(busybox awk -v b=$limit 'BEGIN{printf "%.2f KiB", b/1024}')"
   fi
 
-  echo "$limit" > "${target}/memory.limit_in_bytes" \
-    && log Info "已为 $name 设置内存限制: ${hr_limit} (${limit} 字节)"
+  echo "$limit" > "${target}/memory.limit_in_bytes" 2>/dev/null
+  if [ $? -ne 0 ]; then
+    log Warning "无法设置内存限制到 ${target}/memory.limit_in_bytes"
+    return 1
+  fi
+  log Info "已设置内存限制: ${hr_limit} (${limit} 字节)"
 
-  echo "$PID" > "${target}/cgroup.procs" \
-    && log Info "已分配 PID $PID 到 ${target}"
-
-  return 0
+  echo "$PID" > "${target}/cgroup.procs" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    log Info "已分配 PID $PID 到 ${target}，内存限制 [$hr_limit]"
+    return 0
+  else
+    log Warning "无法将 PID $PID 分配到 ${target}"
+    return 1
+  fi
 }
 
 cgroup_cpuset() {
@@ -983,22 +1030,55 @@ cgroup_cpuset() {
     fi
   fi
 
-  local cpuset_target="${cpuset_path}/foreground"
+  local cpuset_target="${cpuset_path}/box"
+  
   if [ ! -d "${cpuset_target}" ]; then
-    cpuset_target="${cpuset_path}/top-app"
+    mkdir -p "${cpuset_target}" 2>/dev/null
+    if [ ! -d "${cpuset_target}" ]; then
+      log Warning "无法创建 box cpuset 目录: ${cpuset_target}"
+      cpuset_target="${cpuset_path}/foreground"
+      if [ ! -d "${cpuset_target}" ]; then
+        cpuset_target="${cpuset_path}/top-app"
+      fi
+      if [ ! -d "${cpuset_target}" ]; then
+        cpuset_target="${cpuset_path}/apps"
+        if [ ! -d "${cpuset_target}" ]; then
+          log Warning "cpuset 目标未找到，无法设置 CPU 核心"
+          return 1
+        fi
+      fi
+      log Info "回退使用现有 cpuset 目录: ${cpuset_target}"
+    else
+      log Info "成功创建专用 box cpuset 目录: ${cpuset_target}"
+      if [ -f "${cpuset_path}/cpus" ]; then
+        cat "${cpuset_path}/cpus" > "${cpuset_target}/cpus" 2>/dev/null
+      fi
+      if [ -f "${cpuset_path}/mems" ]; then
+        cat "${cpuset_path}/mems" > "${cpuset_target}/mems" 2>/dev/null
+      fi
+    fi
   fi
-  if [ ! -d "${cpuset_target}" ]; then
-    cpuset_target="${cpuset_path}/apps"
-    [ ! -d "${cpuset_target}" ] && log Warning "cpuset 目标未找到" && return 1
+
+  echo "${cores}" > "${cpuset_target}/cpus" 2>/dev/null
+  if [ $? -ne 0 ]; then
+    log Warning "无法设置 CPU 核心到 ${cpuset_target}/cpus"
+    return 1
+  fi
+  
+  echo "0" > "${cpuset_target}/mems" 2>/dev/null
+  if [ $? -ne 0 ]; then
+    log Warning "无法设置内存节点到 ${cpuset_target}/mems"
+    return 1
   fi
 
-  echo "${cores}" > "${cpuset_target}/cpus"
-  echo "0" > "${cpuset_target}/mems"
-
-  echo "${PID}" > "${cpuset_target}/cgroup.procs" \
-    && log Info "已分配 PID $PID 到 ${cpuset_target}，CPU 核心 [$cores]"
-
-  return 0
+  echo "${PID}" > "${cpuset_target}/cgroup.procs" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    log Info "已分配 PID $PID 到 ${cpuset_target}，CPU 核心 [$cores]"
+    return 0
+  else
+    log Warning "无法将 PID $PID 分配到 ${cpuset_target}"
+    return 1
+  fi
 }
 
 webroot() {

@@ -56,16 +56,16 @@ log_service_results() {
     local uids="$3"
 
     echo "" >> "${uid_log}"
-    echo "--- ${core_name} 服务处理结果 ---" >> "${uid_log}"
-    echo "$(date)" >> "${uid_log}"
-    echo "[Info] 操作: 更新UID列表" >> "${uid_log}"
+    echo "--- ${core_name} 服务处理结果 ---" >> "${box_run}/uid.log"
+    echo "$(date)" >> "${box_run}/uid.log"
+    echo "[Info] 操作: 更新TUN模式UID列表" >> "${box_run}/uid.log"
     
     if [ -n "$uids" ]; then
-        echo "[Info] 模式: ${proxy_mode_type}" >> "${uid_log}"
-        echo "[Debug] 应用的 UIDs: ${uids}" >> "${uid_log}"
+        echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
+        echo "[Debug] 应用的 UIDs: ${uids}" >> "${box_run}/uid.log"
     else
-        echo "[Info] 模式: ${proxy_mode_type}" >> "${uid_log}"
-        echo "[Debug] 应用的 UIDs: (无)" >> "${uid_log}"
+        echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
+        echo "[Debug] 应用的 UIDs: (无)" >> "${box_run}/uid.log"
     fi
 }
 

@@ -36,7 +36,7 @@ jobs:
       - name: Generate Asset
         run: |
           sudo mkdir -p /box
-          sudo cp -r --parents $(find ./ -type f ! -path './.git/*' ! -name 'CHANGELOG.md' ! -name 'update.json' ! -name 'build.sh' ! -path './.github/*' ! -path './docs/*')  /box/
+          sudo cp -r --parents $(find ./ -type f ! -path './.git/*' ! -name 'CHANGELOG.md' ! -name 'update.json' ! -name 'build.sh' ! -path './.github/*' ! -path './docs/*' ! -name 'LICENSE')  /box/
 
       - name: Upload Debug Asset => (box_${{ steps.get_version.outputs.version }})
         uses: actions/upload-artifact@v4
@@ -88,6 +88,7 @@ jobs:
           COMMIT_DATE=$(git log -1 --pretty=format:"%ad" --date=short)
           
           # Escape HTML special characters for Telegram HTML parse mode
+          # Convert backticks to <code> tags for better Telegram display
           COMMIT_MSG_ESCAPED=$(echo "$COMMIT_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/`\([^`]*\)`/<code>\1<\/code>/g')
           COMMIT_AUTHOR_ESCAPED=$(echo "$COMMIT_AUTHOR" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
           
