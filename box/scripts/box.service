@@ -213,8 +213,8 @@ prepare_singbox() {
   # 确保日志路径是绝对路径
   ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${sing_config}" 2>/dev/null || true
 
-  # 格式化 sing-box 配置
-  if ${bin_path} format -w -c "${sing_config}" > "${box_run}/${bin_name}.log" 2>&1; then
+  # 检查 sing-box 配置
+  if ${bin_path} check -c "${sing_config}" > "${box_run}/${bin_name}.log" 2>&1; then
     # 根据 network_mode 设置 auto_route
     if [[ "${network_mode}" == @(mixed|tun) ]]; then
       # 检查配置中是否有 "type": "tun"
