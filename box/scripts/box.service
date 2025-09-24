@@ -214,7 +214,7 @@ prepare_singbox() {
   ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${sing_config}" 2>/dev/null || true
 
   # 检查 sing-box 配置
-  if ${bin_path} check -c "${sing_config}" > "${box_run}/${bin_name}.log" 2>&1; then
+  if ( cd "$(dirname "${sing_config}")" && "${bin_path}" check -c "$(basename "${sing_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
     # 根据 network_mode 设置 auto_route
     if [[ "${network_mode}" == @(mixed|tun) ]]; then
       # 检查配置中是否有 "type": "tun"
