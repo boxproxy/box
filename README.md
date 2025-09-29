@@ -1,6 +1,4 @@
-# 📦 Box for Android 模块
-
-一个高度可定制的安卓代理模块，专为 Magisk 和 KernelSU 等设计，旨在提供稳定、灵活、透明的网络代理体验。
+# 📦 Box 模块
 
 本项目深受 [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk) 和 [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk) 的启发和影响，在此向原作者们表示衷心的感谢！
 
