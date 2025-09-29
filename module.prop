@@ -1,7 +1,7 @@
 id=box_for_root
 name=Box for Magisk/KernelSU
-version=1.2.4
-versionCode=20250823
+version=1.2.5
+versionCode=20250929
 author=boxproxy,taamarin
 description=📦 Box for Root - 为Android设备提供透明代理工具箱 🚀 支持clash、sing-box、v2ray、hysteria和xray等多种代理工具
 updateJson=https://github.com/boxproxy/box/raw/master/update.json
