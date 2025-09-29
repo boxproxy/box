@@ -1,31 +1,25 @@
-proxy-anchor:
-  select_use: &select_use
-    type: select
-    include-all: true
-    exclude-type: "dns"
-  
-  auto_use: &auto_use
-    type: url-test
-    include-all: true
-    exclude-type: "dns"
-
-  select_proxy: &select_proxy
-    type: select
-    proxies: [主要节点, 手动切换, 自动选择, 故障转移组, 手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国, 国内直连, 广告拦截]
-
-  test_proxy: &test_proxy
-    type: file
+proxy-providers:
+  proxy1:
+    type: http
+    url: "填写订阅链接"
+    path: ./proxy_provider/proxy1.yaml
     health-check:
       enable: true
       url: https://cp.cloudflare.com
       interval: 300
       timeout: 1000
       tolerance: 100
-
-proxy-providers:
-  proxy1:
-    <<: *test_proxy
-    path: ./proxy_provider/proxy1.yaml
+  # 多订阅按照下面照葫芦画瓢即可
+  # proxy2:
+  #   type: http
+  #   url: "填写订阅链接"
+  #   path: ./proxy_provider/proxy2.yaml
+  #   health-check:
+  #     enable: true
+  #     url: https://cp.cloudflare.com
+  #     interval: 300
+  #     timeout: 1000
+  #     tolerance: 100
 
 mixed-port: 7890
 redir-port: 9797
@@ -34,13 +28,12 @@ mode: Rule
 bind-address: '*'
 ipv6: true
 allow-lan: true
-unified-delay: true
+unified-delay: false
 tcp-concurrent: true
 log-level: error
 find-process-mode: always
 global-client-fingerprint: random
 external-controller: 0.0.0.0:9090
-secret: ""
 external-ui: ./dashboard
 
 profile:
@@ -49,20 +42,20 @@ profile:
 
 sniffer:
   enable: true
-  force-dns-mapping: true
-  parse-pure-ip: true
+  override-destination: false
   sniff:
     HTTP:
       ports: [80, 8080-8880]
+      override-destination: true
     TLS:
       ports: [443, 8443]
     QUIC:
       ports: [443, 8443]
 
 tun:
-  enable: false
+  enable: true
   device: meta
-  stack: mixed
+  stack: gvisor
   dns-hijack: [any:53, tcp://any:53]
   udp-timeout: 300
   auto-route: true
@@ -72,225 +65,93 @@ tun:
 
 dns:
   enable: true
-  prefer-h3: true
   ipv6: true
   listen: 0.0.0.0:1053
   enhanced-mode: fake-ip
-  fake-ip-range: 28.0.0.1/8
+  fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
     - "rule-set:Fake-IP-Filter"
   proxy-server-nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
+    - https://223.5.5.5/dns-query
+    - https://120.53.53.53/dns-query
   nameserver-policy:
     "rule-set:cn_domain":
-      - https://dns.alidns.com/dns-query
-      - https://doh.pub/dns-query
-    "rule-set:awavenue":
-      - rcode://success
+      - https://223.5.5.5/dns-query
+      - https://120.53.53.53/dns-query
   nameserver:
-    - https://cloudflare-dns.com/dns-query#DNS
-    - https://dns.google/dns-query#DNS
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
 
 proxies:
   - {name: DNS_Hijack, type: dns}
 
 proxy-groups:
-  - name: Ai
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/AI.png
-
-  - name: FCM推送
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Mail.png
-
-  - name: 谷歌服务
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Google_Search.png
-
-  - name: 微软服务
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Microsoft.png
-
-  - name: GITHUB
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/GitHub.png
-
-  - name: 油管视频
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/YouTube.png
-
-  - name: 奈飞视频
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Netflix.png
-
-  - name: 电报消息
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Telegram.png
-
   - name: 国外代理
-    <<: *select_proxy
+    type: select
+    include-all: true
+    exclude-type: "dns"
     icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Proxy.png
 
   - name: 国内直连
     type: select
-    proxies: [DIRECT, REJECT]
+    proxies: [DIRECT]
     include-all: true
     exclude-type: "dns"
     icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/China.png
 
-  - name: DNS
-    <<: *select_proxy
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Domestic.png
-
-  - name: 广告拦截
-    type: select
-    proxies: [REJECT, 国内直连, REJECT-DROP, PASS]
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Reject.png
-
   - name: 漏网之鱼
-    <<: *select_proxy
+    type: select
+    proxies: [DIRECT]
+    include-all: true
+    exclude-type: "dns"
     icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Final.png
 
-  - name: 主要节点
-    type: select
-    proxies: [手动切换, 自动选择, 故障转移组, 手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国, 国内直连, 广告拦截]
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Star.png
-
-  - name: 手动切换
-    <<: *select_use
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Rocket.png
-
-  - name: 故障转移组
-    type: fallback
-    proxies: [手动选择_香港, 手动选择_台湾, 手动选择_新加坡, 手动选择_日本, 手动选择_美国]
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Back.png
-
-  - name: 手动选择_香港
-    <<: *select_use
-    filter: "(?i)(🇭🇰|香港|hong kong|hk|hksar)"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Hong_Kong.png
-
-  - name: 手动选择_台湾
-    <<: *select_use
-    filter: "(?i)(🇹🇼|台湾|taiwan|tw|twn|台北|taipei|高雄|kaohsiung|台中|taichung|新北|new taipei)"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Taiwan.png
-
-  - name: 手动选择_新加坡
-    <<: *select_use
-    filter: "(?i)(🇸🇬|新加坡|狮城|singapore|sg|sgp)"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Singapore.png
-
-  - name: 手动选择_日本
-    <<: *select_use
-    filter: "(?i)(🇹🇼|日本|japan|jpn|jp|tokyo|大阪|osaka|京都|kyoto|福冈|fukuoka|札幌|sapporo|名古屋|nagoya)"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Japan.png
-
-  - name: 手动选择_美国
-    <<: *select_use
-    filter: "(?i)(🇺🇸|美国|united states|usa|us|america|加州|california|纽约|new york|德克萨斯|texas|佛罗里达|florida|华盛顿|washington|芝加哥|chicago|洛杉矶|los angeles|旧金山|san francisco)"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/United_States.png
-
-  - name: 自动选择
-    <<: *auto_use
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Auto.png
-
-rule-anchor:
-  classical: &classical
-    type: http
-    behavior: classical
-    format: yaml
-    interval: 86400
-
-  ipcidr: &ipcidr
-    type: http
-    behavior: ipcidr
-    format: mrs
-    interval: 86400
-
-  domain: &domain
+rule-providers:
+  Fake-IP-Filter:
     type: http
     behavior: domain
     format: mrs
     interval: 86400
-
-rule-providers:
-  Ai:
-    <<: *domain
-    path: ./rule_provider/ai.mrs
-    url: "https://raw.githubusercontent.com/DustinWin/ruleset_geodata/refs/heads/mihomo-ruleset/ai.mrs"
-  Fake-IP-Filter:
-    <<: *domain
     path: ./rule_provider/Fake-IP-Filter.mrs
     url: "https://github.com/DustinWin/ruleset_geodata/raw/refs/heads/mihomo-ruleset/fakeip-filter.mrs"
-  netflix_ip:
-    <<: *ipcidr
-    path: ./rule_provider/netflix_ip.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/netflix.mrs"
-  netflix_domain:
-    <<: *domain
-    path: ./rule_provider/netflix_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/netflix.mrs"
-  telegram_ip:
-    <<: *ipcidr
-    path: ./rule_provider/telegram_ip.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/telegram.mrs"
-  telegram_domain:
-    <<: *domain
-    path: ./rule_provider/telegram_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/telegram.mrs"
-  github_domain:
-    <<: *domain
-    path: ./rule_provider/github_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/github.mrs"
-  youtube_domain:
-    <<: *domain
-    path: ./rule_provider/youtube_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/youtube.mrs"
-  google_ip:
-    <<: *ipcidr
-    path: ./rule_provider/google_ip.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/google.mrs"
-  google_domain:
-    <<: *domain
-    path: ./rule_provider/google_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/google.mrs"
-  microsoft_domain:
-    <<: *domain
-    path: ./rule_provider/microsoft_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/microsoft.mrs"
+  proxy_domain:
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    path: ./rule_provider/proxy_domain.mrs
+    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo-lite/geosite/proxy.mrs"
   cn_ip:
-    <<: *ipcidr
+    type: http
+    behavior: ipcidr
+    format: mrs
+    interval: 86400
     path: ./rule_provider/cn_ip.mrs
     url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/cn.mrs"
   private_ip:
-    <<: *ipcidr
+    type: http
+    behavior: ipcidr
+    format: mrs
+    interval: 86400
     path: ./rule_provider/private_ip.mrs
     url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/private.mrs"
   cn_domain:
-    <<: *domain
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
     path: ./rule_provider/cn_domain.mrs
     url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/cn.mrs"
   private_domain:
-    <<: *domain
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
     path: ./rule_provider/private_domain.mrs
     url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/private.mrs"
-  awavenue:
-    <<: *domain
-    path: ./rule_provider/awavenue.mrs
-    url: "https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Clash.mrs"
   
 rules:
   - DST-PORT,53,DNS_Hijack
-  - DOMAIN-SUFFIX,omarea.com,国外代理
-  - OR,((DST-PORT,5228),(DOMAIN-REGEX,^.*mtalk.google.com)),FCM推送
-  - RULE-SET,Ai,Ai
-  - OR,((RULE-SET,netflix_ip,no-resolve),(RULE-SET,netflix_domain)),奈飞视频
-  - OR,((RULE-SET,telegram_ip,no-resolve),(RULE-SET,telegram_domain)),电报消息
-  - RULE-SET,github_domain,GITHUB
-  - RULE-SET,youtube_domain,油管视频
-  - OR,((RULE-SET,google_ip,no-resolve),(RULE-SET,google_domain)),谷歌服务
-  - RULE-SET,microsoft_domain,微软服务
-  - RULE-SET,awavenue,广告拦截
+  - RULE-SET,proxy_domain,国外代理
   - OR,((RULE-SET,cn_ip),(RULE-SET,cn_domain),(RULE-SET,private_ip),(RULE-SET,private_domain)),国内直连
   - MATCH,漏网之鱼
