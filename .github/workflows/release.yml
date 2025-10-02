@@ -10,8 +10,9 @@ on:
         description: '目标分支（用于版本文件更新）'
         required: true
       changelog:
-        description: '更新日志内容'
+        description: '更新日志内容 (用 | 分隔多个项目)'
         required: true
+        type: string
 
 jobs:
   build:
@@ -57,14 +58,34 @@ jobs:
             echo "# Changelog" > CHANGELOG.md
             echo "" >> CHANGELOG.md
           fi
+          
           {
             echo "#### Changelog $VERSION - $DATE_HUMAN"
-            echo "$CHANGELOG" | sed 's/^/- /'
+            echo "$CHANGELOG" | tr '|' '\n' | while IFS= read -r line; do
+              trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              if [ -n "$trimmed_line" ]; then
+                echo "- $trimmed_line"
+              fi
+            done
             echo ""
             cat CHANGELOG.md
           } > CHANGELOG.tmp && mv CHANGELOG.tmp CHANGELOG.md
 
-      # 4. Commit and push changes
+      # 4. Format changelog for GitHub Release
+      - name: Format changelog for release
+        id: format_changelog
+        run: |
+          FORMATTED=$(echo "${{ github.event.inputs.changelog }}" | tr '|' '\n' | while IFS= read -r line; do
+            trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -n "$trimmed_line" ]; then
+              echo "- $trimmed_line"
+            fi
+          done)
+          echo "formatted_changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$FORMATTED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # 5. Commit and push changes
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
@@ -73,13 +94,13 @@ jobs:
           git commit -m "${{ github.event.inputs.tag }}" || echo "No changes to commit"
           git push https://github-actions:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.event.inputs.branch }} --force
 
-      # 5. Run build script
+      # 6. Run build script
       - name: Run build.sh
         run: |
           chmod +x build.sh
           ./build.sh
 
-      # 6. Create GitHub Release
+      # 7. Create GitHub Release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
@@ -88,5 +109,6 @@ jobs:
           generate_release_notes: true
           body: |
             #### Changelog ${{ github.event.inputs.tag }}
-            ${{ github.event.inputs.changelog }}
+            
+            ${{ steps.format_changelog.outputs.formatted_changelog }}
 

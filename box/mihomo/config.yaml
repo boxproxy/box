@@ -72,15 +72,15 @@ dns:
   fake-ip-filter:
     - "rule-set:Fake-IP-Filter"
   proxy-server-nameserver:
-    - https://223.5.5.5/dns-query
-    - https://120.53.53.53/dns-query
+    - 223.5.5.5
+    - 120.53.53.53
   nameserver-policy:
     "rule-set:cn_domain":
-      - https://223.5.5.5/dns-query
-      - https://120.53.53.53/dns-query
+      - 223.5.5.5
+      - 120.53.53.53
   nameserver:
-    - https://8.8.8.8/dns-query
-    - https://1.1.1.1/dns-query
+    - 8.8.8.8
+    - 1.1.1.1
 
 proxies:
   - {name: DNS_Hijack, type: dns}
@@ -90,21 +90,19 @@ proxy-groups:
     type: select
     include-all: true
     exclude-type: "dns"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Proxy.png
+    icon: https://ghfast.top/raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Proxy.png
 
   - name: 国内直连
     type: select
     proxies: [DIRECT]
     include-all: true
     exclude-type: "dns"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/China.png
+    icon: https://ghfast.top/raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/China.png
 
   - name: 漏网之鱼
     type: select
-    proxies: [DIRECT]
-    include-all: true
-    exclude-type: "dns"
-    icon: https://raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Final.png
+    proxies: [国外代理,国内直连]
+    icon: https://ghfast.top/raw.githubusercontent.com/Koolson/Qure/refs/heads/master/IconSet/Color/Final.png
 
 rule-providers:
   Fake-IP-Filter:
@@ -113,42 +111,48 @@ rule-providers:
     format: mrs
     interval: 86400
     path: ./rule_provider/Fake-IP-Filter.mrs
-    url: "https://github.com/DustinWin/ruleset_geodata/raw/refs/heads/mihomo-ruleset/fakeip-filter.mrs"
+    url: "https://ghfast.top/github.com/DustinWin/ruleset_geodata/raw/refs/heads/mihomo-ruleset/fakeip-filter.mrs"
+    proxy: DIRECT
   proxy_domain:
     type: http
     behavior: domain
     format: mrs
     interval: 86400
     path: ./rule_provider/proxy_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo-lite/geosite/proxy.mrs"
+    url: "https://ghfast.top/github.com/DustinWin/ruleset_geodata/raw/refs/heads/mihomo-ruleset/proxy.mrs"
+    proxy: DIRECT
   cn_ip:
     type: http
     behavior: ipcidr
     format: mrs
     interval: 86400
     path: ./rule_provider/cn_ip.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/cn.mrs"
+    url: "https://ghfast.top/github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/cn.mrs"
+    proxy: DIRECT
   private_ip:
     type: http
     behavior: ipcidr
     format: mrs
     interval: 86400
     path: ./rule_provider/private_ip.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/private.mrs"
+    url: "https://ghfast.top/github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geoip/private.mrs"
+    proxy: DIRECT
   cn_domain:
     type: http
     behavior: domain
     format: mrs
     interval: 86400
     path: ./rule_provider/cn_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/cn.mrs"
+    url: "https://ghfast.top/github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/cn.mrs"
+    proxy: DIRECT
   private_domain:
     type: http
     behavior: domain
     format: mrs
     interval: 86400
     path: ./rule_provider/private_domain.mrs
-    url: "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/private.mrs"
+    url: "https://ghfast.top/github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta/geo/geosite/private.mrs"
+    proxy: DIRECT
   
 rules:
   - DST-PORT,53,DNS_Hijack
