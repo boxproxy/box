@@ -3,6 +3,7 @@ proxy-providers:
     type: http
     url: "填写订阅链接"
     path: ./proxy_provider/proxy1.yaml
+    interval: 3600
     health-check:
       enable: true
       url: https://cp.cloudflare.com
@@ -14,6 +15,7 @@ proxy-providers:
   #   type: http
   #   url: "填写订阅链接"
   #   path: ./proxy_provider/proxy2.yaml
+  #   interval: 3600
   #   health-check:
   #     enable: true
   #     url: https://cp.cloudflare.com
@@ -73,14 +75,12 @@ dns:
     - "rule-set:Fake-IP-Filter"
   proxy-server-nameserver:
     - 223.5.5.5
-    - 120.53.53.53
   nameserver-policy:
     "rule-set:cn_domain":
       - 223.5.5.5
-      - 120.53.53.53
   nameserver:
     - 8.8.8.8
-    - 1.1.1.1
+
 
 proxies:
   - {name: DNS_Hijack, type: dns}

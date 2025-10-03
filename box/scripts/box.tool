@@ -802,34 +802,64 @@ xkernel() {
 
 # 更新 yacd
 upxui() {
-  xdashboard="${bin_name}/dashboard"
   if [[ "${bin_name}" == @(mihomo|sing-box) ]]; then
-    file_dashboard="${box_dir}/${xdashboard}.zip"
+    local ui_path
+    if [ "${bin_name}" = "mihomo" ]; then
+      ui_path=$(busybox awk '/^external-ui:/ {print $2}' "${mihomo_config}" | sed "s/['\"]//g")
+    else
+      ui_path=$(busybox awk -F'"' '/"external_ui"/ {print $4}' "${sing_config}" | head -n 1)
+    fi
+    
+    if [ -z "${ui_path}" ]; then
+      ui_path="./dashboard"
+      log Warning "配置文件中未找到 external-ui/external_ui 字段，使用默认路径: ${ui_path}"
+    fi
+    log Debug "配置文件中的 UI 路径: ${ui_path}"
+    
+    local dashboard_dir
+    if [[ "${ui_path}" == ./* ]]; then
+      dashboard_dir="${box_dir}/${bin_name}/${ui_path#./}"
+    elif [[ "${ui_path}" == /* ]]; then
+      dashboard_dir="${ui_path}"
+    else
+      dashboard_dir="${box_dir}/${bin_name}/${ui_path}"
+    fi
+    log Info "Dashboard 目标目录: ${dashboard_dir}"
+    
+    file_dashboard="${box_dir}/${bin_name}_dashboard.zip"
     url="https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
     dir_name="dist"
     
     if upfile "${file_dashboard}" "${url}"; then
-      if [ ! -d "${box_dir}/${xdashboard}" ]; then
-        log Info "面板文件夹不存在, 正在创建"
-        mkdir "${box_dir}/${xdashboard}"
+      if [ ! -d "${dashboard_dir}" ]; then
+        log Info "面板文件夹不存在, 正在创建: ${dashboard_dir}"
+        mkdir -p "${dashboard_dir}"
       else
-        rm -rf "${box_dir}/${xdashboard}/"*
+        log Debug "清理现有面板文件: ${dashboard_dir}"
+        rm -rf "${dashboard_dir}/"*
       fi
+      
       if command -v unzip >/dev/null; then
         unzip_command="unzip"
       else
         unzip_command="busybox unzip"
       fi
+      
       log Info "正在解压 Dashboard..."
-      if "${unzip_command}" -oq "${file_dashboard}" "${dir_name}/*" -d "${box_dir}/${xdashboard}"; then
-        mv -f "${box_dir}/${xdashboard}/$dir_name"/* "${box_dir}/${xdashboard}/"
+      local temp_extract_dir="${box_dir}/${bin_name}_dashboard_temp"
+      rm -rf "${temp_extract_dir}"
+      mkdir -p "${temp_extract_dir}"
+      
+      if "${unzip_command}" -oq "${file_dashboard}" "${dir_name}/*" -d "${temp_extract_dir}"; then
+        mv -f "${temp_extract_dir}/${dir_name}"/* "${dashboard_dir}/"
         rm -f "${file_dashboard}"
-        rm -rf "${box_dir}/${xdashboard}/${dir_name}"
-        log Info "Dashboard 更新成功"
+        rm -rf "${temp_extract_dir}"
+        log Info "Dashboard 更新成功 → ${dashboard_dir}"
       else
-         log Error "解压 Dashboard 失败"
-         rm -f "${file_dashboard}"
-         return 1
+        log Error "解压 Dashboard 失败"
+        rm -f "${file_dashboard}"
+        rm -rf "${temp_extract_dir}"
+        return 1
       fi
     else
       log Error "下载 Dashboard 失败"
