@@ -444,7 +444,6 @@ box_run_bin() {
       esac
       nohup busybox setuidgid "${box_user_group}" "${bin_path}" -c "${hysteria_config}" > "${bin_log}" 2>&1 &
       PID=$!
-      sleep 1
       if kill -0 "${PID}" 2>/dev/null; then
         echo -n "${PID}" > "${box_pid}"
       else
@@ -810,7 +809,6 @@ start_box() {
 
   count=0
   while [ $count -le 5 ]; do
-    sleep 0.1
     box_bin_alive || break
     count=$((count + 1))
   done
@@ -829,7 +827,6 @@ stop_box() {
       fi
     fi
   done
-  sleep 0.5
   if ! busybox pidof "${bin_name}" >/dev/null; then
     if [ -f "${box_pid}" ]; then
       rm -f "${box_pid}"
@@ -867,7 +864,6 @@ force_stop() {
     done
   fi
 
-  sleep 0.2
   if ! busybox pgrep -f "${bin_name}" >/dev/null 2>&1; then
     log Warning "完成，现在可以安心休息了"
     rm -f "${box_pid}"
@@ -892,7 +888,6 @@ case "$1" in
     ;;
   restart)
     "${scripts_dir}/box.iptables" disable && stop_box
-    sleep 0.2
     if start_box; then
       "${scripts_dir}/box.iptables" renew
       $scripts_dir/box.tool webroot >/dev/null 2>&1
@@ -913,7 +908,6 @@ case "$1" in
   cron)
     run_crontab="true"
     stop_cron
-    sleep 0.2
     box_run_crontab
     ;;
   kcron)

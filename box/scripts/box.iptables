@@ -376,10 +376,10 @@ start_tproxy() {
   fi
 
   # 跳过已被 TProxy 处理的流量，若默认路由接口有公网 IP，省略这些规则会导致本地流量代理异常，可能拖慢全网
-  # [ ${network_mode} = "enhance" ] || ${iptables} -t mangle -A BOX_EXTERNAL -p tcp -m socket --transparent -j MARK --set-xmark ${fwmark}
-  # ${iptables} -t mangle -A BOX_EXTERNAL -p udp -m socket --transparent -j MARK --set-xmark ${fwmark}
-  # ${iptables} -t mangle -A BOX_EXTERNAL -m socket -j RETURN
- 
+  [ ${network_mode} = "enhance" ] || ${iptables} -t mangle -A BOX_EXTERNAL -p tcp -m socket --transparent -j MARK --set-xmark ${fwmark}
+  ${iptables} -t mangle -A BOX_EXTERNAL -p udp -m socket --transparent -j MARK --set-xmark ${fwmark}
+  ${iptables} -t mangle -A BOX_EXTERNAL -m socket -j RETURN
+
   # 跳过内网，兼容性可用 su -c 'zcat /proc/config.gz | grep -i addrtype' 检查
   # ${iptables} -t mangle -A BOX_EXTERNAL -m addrtype --dst-type LOCAL -j RETURN
   if [ "${iptables}" = "$IPV" ]; then

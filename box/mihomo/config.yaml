@@ -1,3 +1,6 @@
+# 此为精简配置，如需更为详细的配置，可参考 https://wiki.metacubex.one/config
+# 如不会配置，也可自行寻找懒人配置，例如(Surfing 模块配置)：https://raw.githubusercontent.com/GitMetaio/Surfing/refs/heads/main/box_bll/clash/config.yaml
+
 proxy-providers:
   proxy1:
     type: http
@@ -80,7 +83,6 @@ dns:
       - 223.5.5.5
   nameserver:
     - 8.8.8.8
-
 
 proxies:
   - {name: DNS_Hijack, type: dns}

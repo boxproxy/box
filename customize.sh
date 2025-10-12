@@ -300,4 +300,15 @@ unzip -o "$ZIPFILE" 'webroot/*' -d "$MODPATH" >&2
 ui_print "- 清理残留文件"
 rm -rf /data/adb/box/bin/.bin $MODPATH/box $MODPATH/box_service.sh
 
+if [ "$backup_box" = "true" ] && [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
+  ui_print " "
+  if handle_choice "检测到更新残留备份文件，是否删除？" "删除备份" "保留备份"; then
+    ui_print "- 正在删除备份: ${temp_dir}"
+    rm -rf "${temp_dir}"
+    ui_print "- 备份已删除"
+  else
+    ui_print "- 备份已保留在: ${temp_dir}"
+  fi
+fi
+
 ui_print "- 安装完成，请重启设备。"
