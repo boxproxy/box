@@ -356,6 +356,60 @@ upgeox_all() {
   bin_name=$original_bin_name
 }
 
+# 更新 mihomo 配置的 proxy-providers
+update_mihomo_providers() {
+  yq="yq"
+  if ! command -v yq &>/dev/null; then
+    if [ ! -e "${box_dir}/bin/yq" ]; then
+      log Debug "yq 文件未找到, 开始从 GitHub 下载"
+      ${scripts_dir}/box.tool upyq
+    fi
+    yq="${box_dir}/bin/yq"
+  fi
+
+  if [ ! -f "${mihomo_config}" ]; then
+    log Error "配置文件不存在: ${mihomo_config}"
+    return 1
+  fi
+  cp "${mihomo_config}" "${mihomo_config}.bak" 2>/dev/null
+  local file_count=${#name_provide_mihomo_config[@]}
+  if [ "$file_count" -eq 0 ]; then
+    log Warning "没有配置的订阅文件"
+    return 1
+  fi
+
+  log Debug "开始更新 proxy-providers 配置项..."
+  local config_dir="$(dirname "${mihomo_config}")"  
+  for i in $(seq 0 $((file_count - 1))); do
+    local file_name="${name_provide_mihomo_config[$i]}"
+    local provider_file="${mihomo_provide_path}/${file_name}"
+    local provider_name="${file_name%.yaml}"    
+    if [ ! -f "${provider_file}" ]; then
+      log Warning "订阅文件不存在，跳过: ${provider_file}"
+      continue
+    fi
+    local relative_path
+    if command -v realpath >/dev/null 2>&1; then
+      relative_path="$(realpath --relative-to="${config_dir}" "${provider_file}")"
+    else
+      local provide_dir_name="$(basename "${mihomo_provide_path}")"
+      relative_path="./${provide_dir_name}/${file_name}"
+    fi
+
+    log Debug "添加 provider: ${provider_name} -> ${relative_path}"
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".type = \"file\"" "${mihomo_config}" 2>/dev/null
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".path = \"${relative_path}\"" "${mihomo_config}" 2>/dev/null
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".enable = true" "${mihomo_config}" 2>/dev/null
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".url = \"https://cp.cloudflare.com\"" "${mihomo_config}" 2>/dev/null
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".interval = 300" "${mihomo_config}" 2>/dev/null
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".timeout = 1000" "${mihomo_config}" 2>/dev/null
+    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".tolerance = 100" "${mihomo_config}" 2>/dev/null
+  done
+  
+  log Debug "proxy-providers 配置构建完成"
+  return 0
+}
+
 # 检查并更新订阅
 upsubs() {
   if [ "${update_subscription}" != "true" ]; then
@@ -487,11 +541,20 @@ upsubs() {
       done
 
       log Info "成功更新 ${success_count} / ${url_count} 个订阅"
+      
+      if [ "${renew}" != "true" ] && [ "${success_count}" -gt 0 ]; then
+        log Info "正在更新 ${name_mihomo_config} 的 proxy-providers 配置..."
+        if update_mihomo_providers; then
+          log Info "proxy-providers 配置更新成功"
+        else
+          log Warning "proxy-providers 配置更新失败，请手动检查配置文件"
+        fi
+      fi
+      
       if [ "${update_failed}" = "true" ]; then
         log Error "部分订阅链接更新失败"
         return 1
       else
-        log Warning "请确保您的 ${name_mihomo_config} 的 'proxy-providers' 部分已正确配置, 以加载这些订阅文件"
         log Info "更新订阅于 $(date +"%F %R")"
         return 0
       fi
