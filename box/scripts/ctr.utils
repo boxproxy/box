@@ -1,45 +1,68 @@
 #!/system/bin/sh
 
+# 获取当前 WiFi SSID
 get_current_ssid() {
-  SSID=$(cmd wifi status 2>/dev/null | sed -n 's/.*SSID: "\([^"]*\)".*/\1/p' | head -n1)
-
-  if [ -z "$SSID" ] || [ "$SSID" = "<unknown ssid>" ]; then
-
-      SSID=$(iwconfig wlan0 2>/dev/null | grep 'ESSID' | busybox awk -F ':' '{print $2}' | tr -d '"')
-      if [ -z "$SSID" ] || [ "$SSID" = "off/any" ]; then
-        echo "unknown"
-      else
-        echo "$SSID"
-      fi
+  local ssid
+  
+  ssid=$(cmd wifi status 2>/dev/null | sed -n 's/.*SSID: "\([^"]*\)".*/\1/p' | head -n1)
+  
+  if [ -z "$ssid" ] || [ "$ssid" = "<unknown ssid>" ]; then
+    ssid=$(iwconfig wlan0 2>/dev/null | busybox awk -F'ESSID:' '{print $2}' | tr -d '"' | busybox awk '{print $1}')
+  fi
+  
+  if [ -z "$ssid" ] || [ "$ssid" = "off/any" ]; then
+    echo "unknown"
   else
-    echo "$SSID"
+    echo "$ssid"
   fi
 }
 
+# 检查 WiFi 是否连接
 is_wifi_connected() {
-
-  wifi_enabled=$(dumpsys wifi | grep 'Wi-Fi is enabled')
-  wifi_ip=$(ip addr show wlan0 | grep 'inet ' | busybox awk '{print $2}' | cut -d/ -f1)
-
-  if [ -n "$wifi_enabled" ] && [ -n "$wifi_ip" ]; then
+  if ip addr show wlan0 2>/dev/null | grep -q 'inet '; then
     echo "wifi"
   else
     echo "not_wifi"
   fi
 }
 
-is_allowed_wifi() {
-  ssid_list="$(IFS=,; echo "${wifi_ssids_list[*]}")"
+# 获取 WiFi IP 地址
+get_wifi_ip() {
+  ip addr show wlan0 2>/dev/null | busybox awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+}
 
-  local ssid=$(echo "$1" | xargs)
-  local list="$ssid_list"
-
-  IFS=','
-  for allowed in $list; do
-    allowed=$(echo "$allowed" | xargs)
-    if [ "$ssid" = "$allowed" ]; then
-      return 0
-    fi
+# 检查 SSID 是否在列表中
+is_ssid_in_list() {
+  local ssid="$1"
+  local item
+  
+  for item in "${wifi_ssids_list[@]}"; do
+    [ "$ssid" = "$item" ] && return 0
   done
+  
   return 1
+}
+
+# 判断是否应该启用服务
+should_enable_service() {
+  local wifi_status="$1"
+  local ssid="$2"
+  
+  if [ "$wifi_status" = "not_wifi" ]; then
+    [ "$use_module_on_wifi_disconnect" = "true" ] && return 0 || return 1
+  fi
+  
+  if [ "$use_module_on_wifi" = "false" ]; then
+    return 1
+  fi
+  
+  if [ "$use_ssid_matching" = "true" ]; then
+    if is_ssid_in_list "$ssid"; then
+      [ "$use_wifi_list_mode" = "whitelist" ] && return 0 || return 1
+    else
+      [ "$use_wifi_list_mode" = "whitelist" ] && return 1 || return 0
+    fi
+  fi
+  
+  return 0
 }

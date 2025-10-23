@@ -2,15 +2,7 @@
 
 scripts_dir="${0%/*}"
 
-# user agent
 user_agent="box_for_root"
-# 是否使用 ghfast 加速 GitHub 下载
-url_ghproxy="https://ghfast.top"
-# 启用/禁用下载稳定的 mihomo 内核
-mihomo_stable="enable"
-singbox_stable="enable"
-
-# 这会覆盖上面设置的默认值
 source /data/adb/box/settings.ini
 
 # 使用 settings.ini 中提供的 log()
@@ -380,31 +372,81 @@ update_mihomo_providers() {
 
   log Debug "开始更新 proxy-providers 配置项..."
   local config_dir="$(dirname "${mihomo_config}")"  
+  
+  local temp_providers="${mihomo_config}.providers.tmp"
+  echo "proxy-providers:" > "${temp_providers}"
+  
   for i in $(seq 0 $((file_count - 1))); do
     local file_name="${name_provide_mihomo_config[$i]}"
     local provider_file="${mihomo_provide_path}/${file_name}"
     local provider_name="${file_name%.yaml}"    
-    if [ ! -f "${provider_file}" ]; then
-      log Warning "订阅文件不存在，跳过: ${provider_file}"
-      continue
-    fi
+    
+    [ ! -f "${provider_file}" ] && log Warning "订阅文件不存在，跳过: ${provider_file}" && continue
+    
     local relative_path
     if command -v realpath >/dev/null 2>&1; then
       relative_path="$(realpath --relative-to="${config_dir}" "${provider_file}")"
     else
-      local provide_dir_name="$(basename "${mihomo_provide_path}")"
-      relative_path="./${provide_dir_name}/${file_name}"
+      relative_path="./$(basename "${mihomo_provide_path}")/${file_name}"
     fi
 
     log Debug "添加 provider: ${provider_name} -> ${relative_path}"
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".type = \"file\"" "${mihomo_config}" 2>/dev/null
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".path = \"${relative_path}\"" "${mihomo_config}" 2>/dev/null
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".enable = true" "${mihomo_config}" 2>/dev/null
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".url = \"https://cp.cloudflare.com\"" "${mihomo_config}" 2>/dev/null
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".interval = 300" "${mihomo_config}" 2>/dev/null
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".timeout = 1000" "${mihomo_config}" 2>/dev/null
-    ${yq} -i ".\"proxy-providers\".\"${provider_name}\".\"health-check\".tolerance = 100" "${mihomo_config}" 2>/dev/null
+    
+    cat >> "${temp_providers}" <<EOF
+  ${provider_name}:
+    type: file
+    path: ${relative_path}
+    health-check:
+      enable: true
+      url: https://cp.cloudflare.com
+      interval: 300
+      timeout: 1000
+      tolerance: 100
+EOF
   done
+  
+  local temp_output="${mihomo_config}.output.tmp"
+  
+  awk -v new_providers="${temp_providers}" '
+    BEGIN {
+      in_providers = 0
+      providers_done = 0
+    }
+    /^proxy-providers:/ {
+      in_providers = 1
+      if (providers_done == 0) {
+        while ((getline line < new_providers) > 0) {
+          print line
+        }
+        close(new_providers)
+        providers_done = 1
+      }
+      next
+    }
+    in_providers == 1 && /^[a-zA-Z-]+:/ {
+      in_providers = 0
+      print
+      next
+    }
+    in_providers == 1 {
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (providers_done == 0) {
+        while ((getline line < new_providers) > 0) {
+          print line
+        }
+        close(new_providers)
+      }
+    }
+  ' "${mihomo_config}" > "${temp_output}"
+  
+  mv "${temp_output}" "${mihomo_config}"
+  
+  rm -f "${temp_providers}"
   
   log Debug "proxy-providers 配置构建完成"
   return 0

@@ -130,11 +130,11 @@ ui_print "==========================================================="
 
 if handle_choice "是否需要下载内核或数据文件？" "是，进行下载" "否，全部跳过"; then
 
-    if handle_choice "是否使用 'ghfast.top' 镜像加速接下来的下载？" "使用加速" "直接下载"; then
-        ui_print "- 已启用 ghfast 加速。"
+    if handle_choice "是否使用镜像加速接下来的下载？" "使用加速" "直接下载"; then
+        ui_print "- 已启用镜像加速。"
         sed -i 's/use_ghproxy=.*/use_ghproxy="true"/' /data/adb/box/settings.ini
     else
-        ui_print "- 已禁用 ghfast 加速。"
+        ui_print "- 已禁用镜像加速。"
         sed -i 's/use_ghproxy=.*/use_ghproxy="false"/' /data/adb/box/settings.ini
     fi
 
