@@ -585,11 +585,15 @@ upsubs() {
       log Info "成功更新 ${success_count} / ${url_count} 个订阅"
       
       if [ "${renew}" != "true" ] && [ "${success_count}" -gt 0 ]; then
-        log Info "正在更新 ${name_mihomo_config} 的 proxy-providers 配置..."
-        if update_mihomo_providers; then
-          log Info "proxy-providers 配置更新成功"
+        if [ "${auto_modify_config}" = "true" ]; then
+          log Info "正在更新 ${name_mihomo_config} 的 proxy-providers 配置..."
+          if update_mihomo_providers; then
+            log Info "proxy-providers 配置更新成功"
+          else
+            log Warning "proxy-providers 配置更新失败，请手动检查配置文件"
+          fi
         else
-          log Warning "proxy-providers 配置更新失败，请手动检查配置文件"
+          log Info "auto_modify_config 未启用，跳过更新 proxy-providers 配置"
         fi
       fi
       
