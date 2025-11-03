@@ -263,6 +263,10 @@ start_redirect() {
 
   if [ "${iptables}" = "$IPV" ]; then
     case "${proxy_mode}" in
+      core)
+        ${iptables} -t nat -A BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
+        [ ${network_mode} = "enhance" ] || log Info "核心模式：所有应用透明代理。"
+        ;;
       blacklist|black)
         if [ -z "$(cat "${uid_list}")" ] ; then
           ${iptables} -t nat -A BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
@@ -445,6 +449,11 @@ start_tproxy() {
   fi
 
   case "${proxy_mode}" in
+    core)
+      [ ${network_mode} = "enhance" ] || ${iptables} -t mangle -A BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
+      ${iptables} -t mangle -A BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
+      [ "${iptables}" = "$IPV" ] && log Info "核心模式：所有应用透明代理。"
+      ;;
     blacklist|black)
       if [ -z "$(cat "${uid_list}")" ] ; then
         [ ${network_mode} = "enhance" ] || ${iptables} -t mangle -A BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
@@ -497,7 +506,7 @@ start_tproxy() {
       ${iptables} -t mangle -A BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
       [ "${iptables}" = "$IPV" ] && log Info "所有应用透明代理。"
       ;;
-  esac
+    esac
 
   ${iptables} -t mangle -I OUTPUT -j BOX_LOCAL
 
@@ -641,10 +650,12 @@ log_iptables_results() {
   if [ -n "$applied_uids" ]; then
     echo "[Debug] 应用的 UIDs: $applied_uids" >> "${box_run}/uid.log"
   else
-    if [[ "$proxy_mode" == "whitelist" || "$proxy_mode" == "white" ]]; then
-       echo "[Debug] 应用的 UIDs: (列表为空, 代理所有应用)" >> "${box_run}/uid.log"
+    if [[ "$proxy_mode" == "core" ]]; then
+       echo "[Debug] (核心模式, 所有应用透明代理)" >> "${box_run}/uid.log"
+    elif [[ "$proxy_mode" == "whitelist" || "$proxy_mode" == "white" ]]; then
+       echo "[Debug] (列表为空, 代理所有应用)" >> "${box_run}/uid.log"
     else
-       echo "[Debug] 应用的 UIDs: (列表为空, 不代理任何应用)" >> "${box_run}/uid.log"
+       echo "[Debug] (列表为空, 不代理任何应用)" >> "${box_run}/uid.log"
     fi
   fi
 }

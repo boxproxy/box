@@ -12,10 +12,17 @@ find_packages_uid() {
   echo "--- Box UID/GID 查询日志 ---" >> "${uid_log}"
   echo "$(date)" >> "${uid_log}"
   echo "[Info] 代理模式: ${proxy_mode}" >> "${uid_log}"
+  
+  if [ "${proxy_mode}" = "core" ]; then
+    echo "[Info] 核心模式已启用，跳过 package 和 gid 处理" >> "${uid_log}"
+    > "${uid_list}"
+    return 0
+  fi
+  
   echo "" >> "${uid_log}"
-  echo "--- 从 package.list.cfg 读取的列表 ---" >> "${uid_log}"
-  echo "[Debug] 统一应用列表: ${packages_list[*]}" >> "${uid_log}"
-  echo "[Debug] GID 列表: ${gid_list[*]}" >> "${uid_log}"
+  echo "--- 从配置文件读取的列表 ---" >> "${uid_log}"
+  echo "[Debug] 应用列表 (来自 package.list.cfg): ${packages_list[*]}" >> "${uid_log}"
+  echo "[Debug] GID 列表 (来自 gid.list.cfg): ${gid_list[*]}" >> "${uid_log}"
 
   > "${uid_list}"
 
@@ -60,12 +67,14 @@ log_service_results() {
     echo "$(date)" >> "${box_run}/uid.log"
     echo "[Info] 操作: 更新TUN模式UID列表" >> "${box_run}/uid.log"
     
-    if [ -n "$uids" ]; then
-        echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
+    echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
+    
+    if [ "${proxy_mode_type}" = "core" ]; then
+        echo "[Debug] (核心模式, 所有应用透明代理)" >> "${box_run}/uid.log"
+    elif [ -n "$uids" ]; then
         echo "[Debug] 应用的 UIDs: ${uids}" >> "${box_run}/uid.log"
     else
-        echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
-        echo "[Debug] 应用的 UIDs: (无)" >> "${box_run}/uid.log"
+        echo "[Debug] (无)" >> "${box_run}/uid.log"
     fi
 }
 
@@ -238,7 +247,7 @@ prepare_singbox() {
       fi
     else
       # 非 tun 模式，关闭 auto_route
-      sed -i -e 's/auto_route": true/auto_route": false/g' -e 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${sing_config}"
+      # sed -i -e 's/auto_route": true/auto_route": false/g' -e 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${sing_config}"
 
       # 检查是否有 tproxy 配置
       if ! busybox grep -q '"type": "tproxy"' "${sing_config}"; then
@@ -257,21 +266,29 @@ prepare_singbox() {
     fi
 
     if [[ "${network_mode}" == @(mixed|tun) ]]; then
-      # 为 tun 添加 include_uid/exclude_uid 字段
-      yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
-                 (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
-      
-      [[ ${proxy_mode} = "blacklist" || ${proxy_mode} = "black" ]] && mode="exclude" || mode="include"
-      
-      local uids_to_add=""
-      if [ -s "${uid_list}" ]; then
-        uids_to_add=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
-        if [ -n "$uids_to_add" ]; then
-          yq_filter="$yq_filter | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
+      # core 模式：跳过 UID 处理
+      if [ "${proxy_mode}" = "core" ]; then
+        yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
+                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
+        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
+        log_service_results "sing-box" "core" ""
+      else
+        # 为 tun 添加 include_uid/exclude_uid 字段
+        yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
+                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
+        
+        [[ ${proxy_mode} = "blacklist" || ${proxy_mode} = "black" ]] && mode="exclude" || mode="include"
+        
+        local uids_to_add=""
+        if [ -s "${uid_list}" ]; then
+          uids_to_add=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
+          if [ -n "$uids_to_add" ]; then
+            yq_filter="$yq_filter | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
+          fi
         fi
+        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
+        log_service_results "sing-box" "$mode" "$uids_to_add"
       fi
-      "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
-      log_service_results "sing-box" "$mode" "$uids_to_add"
     fi
 
     # 按 network_mode 添加 redirect 配置
@@ -358,37 +375,46 @@ prepare_mihomo() {
       log Info  "${mihomo_config} 已存在 [tun] 配置"
     fi
 
-    # 为 tun 添加 include-uid/exclude-uid
-    if [ -f "${uid_list}" ]; then
-        list_uid=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
+    # core 模式：跳过 UID 处理
+    if [ "${proxy_mode}" = "core" ]; then
+      sed -i -e "s/exclude-uid:.*/exclude-uid: []/g" \
+          -e "s/include-uid:.*/include-uid: []/g" \
+          -e "/tun:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }" \
+          "${mihomo_config}"
+      log_service_results "mihomo" "core" ""
     else
-        list_uid=""
+      # 为 tun 添加 include-uid/exclude-uid
+      if [ -f "${uid_list}" ]; then
+          list_uid=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
+      else
+          list_uid=""
+      fi
+
+      if [[ "${proxy_mode}" = "whitelist" || "${proxy_mode}" = "white" ]]; then
+        mode="include"
+      elif [[ "${proxy_mode}" = "blacklist" || "${proxy_mode}" = "black" ]]; then
+        mode="exclude"
+      fi
+
+      # 重置 include/exclude_uid 列表并启用 tun
+      sed -i -e "s/exclude-uid:.*/exclude-uid: []/g" \
+          -e "s/include-uid:.*/include-uid: []/g" \
+          -e "/tun:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }" \
+          "${mihomo_config}"
+
+
+      # 检查 tun 块中是否有 include-uid/exclude-uid
+      uid_found=$(busybox awk '/^tun:/{f=1} f && /'"$mode-uid:"'/{print $0; exit}' "$mihomo_config")
+      if [ -z "$uid_found" ]; then
+          sed -i "/^tun:/a \  $mode-uid: []" "$mihomo_config"
+      fi
+
+      # 添加uid到配置
+      if [ -n "${list_uid}" ]; then
+        sed -i "s/${mode}-uid:.*/${mode}-uid: [${list_uid}]/g" "${mihomo_config}"
+      fi
+      log_service_results "mihomo" "$mode" "$list_uid"
     fi
-
-    if [[ "${proxy_mode}" = "whitelist" || "${proxy_mode}" = "white" ]]; then
-      mode="include"
-    elif [[ "${proxy_mode}" = "blacklist" || "${proxy_mode}" = "black" ]]; then
-      mode="exclude"
-    fi
-
-    # 重置 include/exclude_uid 列表并启用 tun
-    sed -i -e "s/exclude-uid:.*/exclude-uid: []/g" \
-        -e "s/include-uid:.*/include-uid: []/g" \
-        -e "/tun:/,/enable:/ { /enable: false/ s/enable: false/enable: true/ }" \
-        "${mihomo_config}"
-
-
-    # 检查 tun 块中是否有 include-uid/exclude-uid
-    uid_found=$(busybox awk '/^tun:/{f=1} f && /'"$mode-uid:"'/{print $0; exit}' "$mihomo_config")
-    if [ -z "$uid_found" ]; then
-        sed -i "/^tun:/a \  $mode-uid: []" "$mihomo_config"
-    fi
-
-    # 添加uid到配置
-    if [ -n "${list_uid}" ]; then
-      sed -i "s/${mode}-uid:.*/${mode}-uid: [${list_uid}]/g" "${mihomo_config}"
-    fi
-    log_service_results "mihomo" "$mode" "$list_uid"
 
   else
     sed -i "/tun:/,/enable:/ { /enable: true/ s/enable: true/enable: false/ }" "${mihomo_config}"

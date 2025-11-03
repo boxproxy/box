@@ -88,37 +88,78 @@ stop_key_listener() {
 }
 
 volume_key_detection() {
-    while read -r line; do
-        if echo "$line" | grep -Eiq "(KEY_)?VOLUME ?UP|KEYCODE_VOLUME_UP" && echo "$line" | grep -Eiq "DOWN|PRESS"; then
-            return 0
-        elif echo "$line" | grep -Eiq "(KEY_)?VOLUME ?DOWN|KEYCODE_VOLUME_DOWN" && echo "$line" | grep -Eiq "DOWN|PRESS"; then
-            return 1
-        fi
-    done < "$KEY_FIFO"
+    local timeout_seconds="${1:-0}"
+    local detection_result_file=$(mktemp -u -p /dev/tmp)
+    
+    (
+        while read -r line; do
+            if echo "$line" | grep -Eiq "(KEY_)?VOLUME ?UP|KEYCODE_VOLUME_UP" && echo "$line" | grep -Eiq "DOWN|PRESS"; then
+                echo "0" > "$detection_result_file"
+                exit 0
+            elif echo "$line" | grep -Eiq "(KEY_)?VOLUME ?DOWN|KEYCODE_VOLUME_DOWN" && echo "$line" | grep -Eiq "DOWN|PRESS"; then
+                echo "1" > "$detection_result_file"
+                exit 0
+            fi
+        done < "$KEY_FIFO"
+    ) &
+    local detection_pid=$!
+    
+    if [ "$timeout_seconds" -gt 0 ]; then
+        (
+            sleep "$timeout_seconds"
+            if kill -0 "$detection_pid" 2>/dev/null; then
+                kill "$detection_pid" 2>/dev/null
+                echo "2" > "$detection_result_file"
+            fi
+        ) &
+        local timeout_pid=$!
+        
+        wait "$detection_pid" 2>/dev/null
+        kill "$timeout_pid" 2>/dev/null
+        wait "$timeout_pid" 2>/dev/null
+    else
+        wait "$detection_pid" 2>/dev/null
+    fi
+    
+    if [ -f "$detection_result_file" ]; then
+        local result=$(cat "$detection_result_file")
+        rm -f "$detection_result_file"
+        return "$result"
+    fi
+    
+    rm -f "$detection_result_file"
+    return 2
 }
 
 handle_choice() {
     local question="$1"
     local choice_yes="${2:-是}"
     local choice_no="${3:-否}"
+    local timeout_seconds="${4:-5}"
 
     ui_print " "
     ui_print "-----------------------------------------------------------"
     ui_print "- ${question}"
     ui_print "- [ 音量加(+) ]: ${choice_yes}"
     ui_print "- [ 音量减(-) ]: ${choice_no}"
+    ui_print "- [ ${timeout_seconds}秒内未选择将默认选择: ${choice_yes} ]"
 
     timeout 0.1 getevent -c 1 >/dev/null 2>&1
 
     start_key_listener
-    if volume_key_detection; then
+    volume_key_detection "$timeout_seconds"
+    local result=$?
+    stop_key_listener
+    
+    if [ "$result" -eq 0 ]; then
         ui_print "  => 您选择了: ${choice_yes}"
-        stop_key_listener
         return 0
-    else
+    elif [ "$result" -eq 1 ]; then
         ui_print "  => 您选择了: ${choice_no}"
-        stop_key_listener
         return 1
+    else
+        ui_print "  => 超时未选择，默认选择: ${choice_yes}"
+        return 0
     fi
 }
 
