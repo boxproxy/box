@@ -135,7 +135,7 @@ handle_choice() {
     local question="$1"
     local choice_yes="${2:-是}"
     local choice_no="${3:-否}"
-    local timeout_seconds="${4:-5}"
+    local timeout_seconds="${4:-10}"
 
     ui_print " "
     ui_print "-----------------------------------------------------------"

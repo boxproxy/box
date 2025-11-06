@@ -432,7 +432,7 @@ prepare_mihomo() {
   fi
 
   if [[ "${network_mode}" == @(mixed|tproxy|redirect|enhance) ]]; then
-    if [[ -n "${packages_list[*]}" || -n "${ignore_out_list[*]}" || -n "${gid_list[*]}" ]] && [ "${mihomo_enhanced_mode}" = "fake-ip" ]; then
+    if [[ "${proxy_mode}" != "core" ]] && [[ -n "${packages_list[*]}" || -n "${ignore_out_list[*]}" || -n "${gid_list[*]}" ]] && [ "${mihomo_enhanced_mode}" = "fake-ip" ]; then
       log Warning "${proxy_mode} 仅在 mihomo 的 enhanced-mode: redir-host 下生效"
       log Warning "已将 fake-ip 替换为 redir-host"
       sed -i "s/enhanced-mode:.*/enhanced-mode: redir-host/g" "${mihomo_config}"
