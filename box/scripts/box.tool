@@ -105,6 +105,46 @@ upfile() {
   return 0
 }
 
+# CN IPv4/IPv6 列表更新
+upcnip() {
+  local did_any=false
+  # IPv4
+  if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ]; then
+    if [ -z "${cn_ip_url}" ] || [ -z "${cn_ip_file}" ]; then
+      log Warning "cn_ip_url 或 cn_ip_file 未配置，跳过 IPv4"
+    else
+      log Info "下载 CN IPv4 列表 → ${cn_ip_file}"
+      if upfile "${cn_ip_file}" "${cn_ip_url}"; then
+        log Info "CN IPv4 列表更新完成"
+        did_any=true
+      else
+        log Error "CN IPv4 列表更新失败"
+      fi
+    fi
+  else
+    log Debug "未启用 IPv4 CN 分流（bypass_cn_ip/bypass_cn_ip_v4=false），跳过下载"
+  fi
+
+  # IPv6
+  if [ "${bypass_cn_ip}" = "true" ] && [ "${ipv6}" = "true" ] && [ "${bypass_cn_ip_v6}" = "true" ]; then
+    if [ -z "${cn_ipv6_url}" ] || [ -z "${cn_ipv6_file}" ]; then
+      log Warning "cn_ipv6_url 或 cn_ipv6_file 未配置，跳过 IPv6"
+    else
+      log Info "下载 CN IPv6 列表 → ${cn_ipv6_file}"
+      if upfile "${cn_ipv6_file}" "${cn_ipv6_url}"; then
+        log Info "CN IPv6 列表更新完成"
+        did_any=true
+      else
+        log Error "CN IPv6 列表更新失败"
+      fi
+    fi
+  else
+    log Debug "未启用 IPv6 CN 分流或未开启 IPv6，跳过下载"
+  fi
+
+  $did_any && return 0 || return 1
+}
+
 # 重启核心进程
 restart_box() {
   local core_to_restart=${1:-$bin_name}
@@ -908,15 +948,16 @@ xkernel() {
   
   bin_name=$original_bin_name
 }
-
-# 更新 yacd
 upxui() {
   if [[ "${bin_name}" == @(mihomo|sing-box) ]]; then
     local ui_path
+    local ui_url
     if [ "${bin_name}" = "mihomo" ]; then
-      ui_path=$(busybox awk '/^external-ui:/ {print $2}' "${mihomo_config}" | sed "s/['\"]//g")
+      ui_path=$(busybox awk '!/^ *#/ && /^external-ui:/ {print $2; exit}' "${mihomo_config}" | sed "s/[\"']//g")
+      ui_url=$(busybox awk '!/^ *#/ && /^external-ui-url:/ {print $2; exit}' "${mihomo_config}" 2>/dev/null | sed "s/[\"']//g")
     else
-      ui_path=$(busybox awk -F'"' '/"external_ui"/ {print $4}' "${sing_config}" | head -n 1)
+      ui_path=$(busybox awk -F '"' '/"external_ui"/ {print $4}' "${sing_config}" | head -n 1)
+      ui_url=$(busybox awk -F '"' '/"external_ui_download_url"/ {print $4; exit}' "${sing_config}" 2>/dev/null)
     fi
     
     if [ -z "${ui_path}" ]; then
@@ -936,8 +977,11 @@ upxui() {
     log Info "Dashboard 目标目录: ${dashboard_dir}"
     
     file_dashboard="${box_dir}/${bin_name}_dashboard.zip"
-    url="https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
-    dir_name="dist"
+    if [ -n "${ui_url}" ]; then
+      url="${ui_url}"
+    else
+      url="https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+    fi
     
     if upfile "${file_dashboard}" "${url}"; then
       if [ ! -d "${dashboard_dir}" ]; then
@@ -959,17 +1003,38 @@ upxui() {
       rm -rf "${temp_extract_dir}"
       mkdir -p "${temp_extract_dir}"
       
-      if "${unzip_command}" -oq "${file_dashboard}" "${dir_name}/*" -d "${temp_extract_dir}"; then
-        mv -f "${temp_extract_dir}/${dir_name}"/* "${dashboard_dir}/"
-        rm -f "${file_dashboard}"
-        rm -rf "${temp_extract_dir}"
-        log Info "Dashboard 更新成功 → ${dashboard_dir}"
+      if "${unzip_command}" -oq "${file_dashboard}" -d "${temp_extract_dir}"; then
+        local html_path
+        html_path=$(busybox find "${temp_extract_dir}" -maxdepth 3 -type f -name index.html | head -n 1)
+        if [ -n "${html_path}" ]; then
+          local html_dir
+          html_dir="${html_path%/*}"
+          mv -f "${html_dir}"/* "${dashboard_dir}/"
+        else
+          local top_dir
+          top_dir=$(find "${temp_extract_dir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ -n "${top_dir}" ] && [ -z "$(find "${temp_extract_dir}" -mindepth 1 -maxdepth 1 -type d | sed -n '2p')" ]; then
+            mv -f "${top_dir}"/* "${dashboard_dir}/"
+          else
+            mv -f "${temp_extract_dir}"/* "${dashboard_dir}/"
+          fi
+        fi
       else
         log Error "解压 Dashboard 失败"
         rm -f "${file_dashboard}"
         rm -rf "${temp_extract_dir}"
         return 1
       fi
+
+      if [ -z "$(find "${dashboard_dir}" -mindepth 1 -maxdepth 1 | head -n 1)" ]; then
+        log Error "Dashboard 目录为空，更新失败"
+        rm -f "${file_dashboard}"
+        rm -rf "${temp_extract_dir}"
+        return 1
+      fi
+      rm -f "${file_dashboard}"
+      rm -rf "${temp_extract_dir}"
+      log Info "Dashboard 更新成功 → ${dashboard_dir}"
     else
       log Error "下载 Dashboard 失败"
       return 1
@@ -1343,6 +1408,9 @@ case "$1" in
   upxui)
     upxui
     ;;
+  upcnip)
+    upcnip
+    ;;
   upyq|upcurl)
     $1
     ;;
@@ -1364,7 +1432,7 @@ case "$1" in
     ;;
   *)
     log Error "$0 $1 未找到"
-    log Info "用法: $0 {check|memcg|cpuset|blkio|geosub|geox|subs|upkernel [name]|upkernels [name...]|upgeox_all|upxui|upyq|upcurl|reload|webroot|bond0|bond1|all}"
+    log Info "用法: $0 {check|memcg|cpuset|blkio|geosub|geox|subs|upkernel [name]|upkernels [name...]|upgeox_all|upxui|upyq|upcurl|upcnip|reload|webroot|bond0|bond1|all}"
     log Info "upkernel 支持的核心: sing-box, mihomo, mihomo_smart, xray, v2fly, hysteria"
     ;;
 esac

@@ -6,47 +6,38 @@ source /data/adb/box/settings.ini
 PROPFILE="/data/adb/modules/box_for_root/module.prop"
 
 find_packages_uid() {
-  local uid_log="${box_run}/uid.log"
+  log Info "代理模式: ${proxy_mode}"
 
-  : > "${uid_log}"
-  echo "--- Box UID/GID 查询日志 ---" >> "${uid_log}"
-  echo "$(date)" >> "${uid_log}"
-  echo "[Info] 代理模式: ${proxy_mode}" >> "${uid_log}"
-  
   if [ "${proxy_mode}" = "core" ]; then
-    echo "[Info] 核心模式已启用，跳过 package 和 gid 处理" >> "${uid_log}"
+    log Info "核心模式已启用，跳过 package 和 gid 处理"
     > "${uid_list}"
     return 0
   fi
-  
-  echo "" >> "${uid_log}"
-  echo "--- 从配置文件读取的列表 ---" >> "${uid_log}"
-  echo "[Debug] 应用列表 (来自 package.list.cfg): ${packages_list[*]}" >> "${uid_log}"
-  echo "[Debug] GID 列表 (来自 gid.list.cfg): ${gid_list[*]}" >> "${uid_log}"
+
+  log Info "开始处理 UID/GID 列表"
+  log Debug "应用列表 (来自 package.list.cfg): ${packages_list[*]}"
+  log Debug "GID 列表 (来自 gid.list.cfg): ${gid_list[*]}"
 
   > "${uid_list}"
-
-  echo "" >> "${uid_log}"
-  echo "--- 处理结果 ---" >> "${uid_log}"
 
   for entry in "${packages_list[@]}"; do
     prefix="${entry%%:*}"
     package="${entry#*:}"
-    
+
     local base_uid
     base_uid=$(busybox awk -v p="^${package}$" '$1 ~ p {print $2; exit}' "${system_packages_file}")
     if [ -n "${base_uid}" ]; then
       local multiuser_uid=$((base_uid + prefix * 100000))
       echo "${multiuser_uid}" >> "${uid_list}"
-      echo "[Info] Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}" >> "${uid_log}"
+      log Info "Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
     else
-      echo "[Warning] Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 未找到" >> "${uid_log}"
+      log Warning "Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 未找到"
     fi
   done
 
   if [ ${#gid_list[@]} -gt 0 ]; then
     printf "%s\n" "${gid_list[@]}" >> "${uid_list}"
-    echo "[Info] Success: GID: ${gid_list[*]} -> 已添加" >> "${uid_log}"
+    log Info "Success: GID: ${gid_list[*]} -> 已添加"
   fi
 
   if [ -s "${uid_list}" ]; then
@@ -54,7 +45,6 @@ find_packages_uid() {
     busybox sort -un "${uid_list}" > "${temp_uid_list}"
     mv "${temp_uid_list}" "${uid_list}"
   fi
-
 }
 
 log_service_results() {
@@ -62,19 +52,15 @@ log_service_results() {
     local proxy_mode_type="$2"
     local uids="$3"
 
-    echo "" >> "${uid_log}"
-    echo "--- ${core_name} 服务处理结果 ---" >> "${box_run}/uid.log"
-    echo "$(date)" >> "${box_run}/uid.log"
-    echo "[Info] 操作: 更新TUN模式UID列表" >> "${box_run}/uid.log"
-    
-    echo "[Info] 模式: ${proxy_mode_type}" >> "${box_run}/uid.log"
-    
+    log Info "操作: 更新TUN模式UID列表"
+    log Info "模式: ${proxy_mode_type}"
+
     if [ "${proxy_mode_type}" = "core" ]; then
-        echo "[Debug] (核心模式, 所有应用透明代理)" >> "${box_run}/uid.log"
+        log Debug "(核心模式, 所有应用透明代理)"
     elif [ -n "$uids" ]; then
-        echo "[Debug] 应用的 UIDs: ${uids}" >> "${box_run}/uid.log"
+        log Debug "应用的 UIDs: ${uids}"
     else
-        echo "[Debug] (无)" >> "${box_run}/uid.log"
+        log Debug "(无)"
     fi
 }
 
@@ -432,7 +418,7 @@ prepare_mihomo() {
   fi
 
   if [[ "${network_mode}" == @(mixed|tproxy|redirect|enhance) ]]; then
-    if [[ "${proxy_mode}" != "core" ]] && [[ -n "${packages_list[*]}" || -n "${ignore_out_list[*]}" || -n "${gid_list[*]}" ]] && [ "${mihomo_enhanced_mode}" = "fake-ip" ]; then
+    if [[ "${proxy_mode}" != "core" ]] && [[ -n "${packages_list[*]}" || -n "${ignore_ap_list[*]}" || -n "${gid_list[*]}" ]] && [ "${mihomo_enhanced_mode}" = "fake-ip" ]; then
       log Warning "${proxy_mode} 仅在 mihomo 的 enhanced-mode: redir-host 下生效"
       log Warning "已将 fake-ip 替换为 redir-host"
       sed -i "s/enhanced-mode:.*/enhanced-mode: redir-host/g" "${mihomo_config}"
