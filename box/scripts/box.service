@@ -191,6 +191,21 @@ prepare_singbox() {
     log Info "检测到配置 ${sing_config}"
   fi
 
+  # 检查配置文件是否存在outbounds字段
+  if busybox grep -q '"outbounds":' "${sing_config}"; then
+    # outbounds于1.11过时，未来于1.13移除；但大部分机场配置文件仍未迁移至新语法
+    secondary_ver=$(${bin_path} version | head -n 1 | awk '{print $NF}' | awk -F'.' '{print $2}')
+    # 设置环境变量以正常启动
+    if [ $secondary_ver -ge 13 ]; then
+      log Error "outbounds deprecated: use sing-box below 1.13.0 or migrat to rule-actions"
+      exit 1
+    fi
+    if [ $secondary_ver -ge 11 ]; then
+      log Warning "outbounds is deprecated, set ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS as true"
+      export ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS=true
+    fi
+  fi
+
   # 检查 yq
   yq="yq"
   if ! command -v yq >/dev/null 2>&1; then
