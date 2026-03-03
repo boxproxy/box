@@ -6,7 +6,7 @@ user_agent="box_for_root"
 source /data/adb/box/settings.ini
 
 # 使用 settings.ini 中提供的 log()
-TOOL_LOG="/data/adb/box/run/tool.log"
+TOOL_LOG="${box_run}/tool.log"
 busybox mkdir -p "$(dirname "$TOOL_LOG")"
 box_log="$TOOL_LOG"
 

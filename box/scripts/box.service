@@ -20,19 +20,44 @@ find_packages_uid() {
 
   > "${uid_list}"
 
+  local packages_file
+  packages_file="${system_packages_file:-/data/system/packages.list}"
   for entry in "${packages_list[@]}"; do
-    prefix="${entry%%:*}"
-    package="${entry#*:}"
+    local prefix="0"
+    local package="${entry}"
+
+    case "${entry}" in
+      *:*)
+        prefix="${entry%%:*}"
+        package="${entry#*:}"
+        ;;
+    esac
+
+    case "${prefix}" in
+      ''|*[!0-9]*)
+        log Warning "Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 用户前缀无效，已回退为 0"
+        prefix="0"
+        ;;
+    esac
+
+    if [ -z "${package}" ] || [ "${package}" = "${entry}" ] && [ "${entry}" = "${prefix}" ]; then
+      log Warning "Failure: 用户 \"${prefix}\" 应用: \"${entry}\" -> 包名无效"
+      continue
+    fi
 
     local base_uid
-    base_uid=$(busybox awk -v p="^${package}$" '$1 ~ p {print $2; exit}' "${system_packages_file}")
-    if [ -n "${base_uid}" ]; then
-      local multiuser_uid=$((base_uid + prefix * 100000))
-      echo "${multiuser_uid}" >> "${uid_list}"
-      log Info "Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
-    else
-      log Warning "Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 未找到"
-    fi
+    base_uid=$(busybox awk -v pkg="${package}" '$1 == pkg {print $2; exit}' "${packages_file}" 2>/dev/null)
+
+    case "${base_uid}" in
+      ''|*[!0-9]*)
+        log Warning "Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 未找到"
+        continue
+        ;;
+    esac
+
+    local multiuser_uid=$((base_uid + prefix * 100000))
+    echo "${multiuser_uid}" >> "${uid_list}"
+    log Info "Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
   done
 
   if [ ${#gid_list[@]} -gt 0 ]; then
@@ -41,7 +66,7 @@ find_packages_uid() {
   fi
 
   if [ -s "${uid_list}" ]; then
-    local temp_uid_list="${box_run}/temp_uid.list"
+    local temp_uid_list="${box_run_state}/temp_uid.list"
     busybox sort -un "${uid_list}" > "${temp_uid_list}"
     mv "${temp_uid_list}" "${uid_list}"
   fi
@@ -74,7 +99,8 @@ box_check_logs() {
       fi
     done
     # 删除其他日志文件
-    find "${box_run}" -maxdepth 1 -type f \( -name "root" -o \( -name "*.list" -a ! -name "appuid.list" \) -o -name "*.inotify.log" \) -exec rm -f {} +
+    find "${box_run}" -maxdepth 1 -type f \( -name "root" -o -name "*.inotify.log" \) -exec rm -f {} +
+    find "${box_run_state}" -maxdepth 1 -type f \( -name "*.list" -a ! -name "appuid.list" \) -exec rm -f {} +
     # 删除一天前的日志
     find "${box_run}" -maxdepth 1 -type f \( -name "*.log" -o -name "*.old.log" \) -mtime +1 -exec rm -f {} +
   ) &
@@ -100,22 +126,22 @@ box_bin_alive() {
 
 box_run_crontab() {
   pkill -f "busybox crond" >/dev/null 2>&1
-  busybox crontab -c "${box_run}" -r
-  echo "# root 的定时任务" > "${box_run}/root"
+  busybox crontab -c "${box_run_state}" -r
+  echo "# root 的定时任务" > "${box_run_state}/root"
 
   if [ "${run_crontab}" = "true" ]; then
     log Debug "crond 已启用"
     if [ "$update_subscription" = "true" ] || [ "$update_geo" = "true" ]; then
       log Debug "定时任务间隔: ${interva_update}."
-      echo "${interva_update} ${scripts_dir}/box.tool geosub" >> "${box_run}/root"
+      echo "${interva_update} ${scripts_dir}/box.tool geosub" >> "${box_run_state}/root"
       log Info "${bin_name} geox 更新: ${update_geo}."
       if [ "${bin_name}" = "mihomo" ]; then
         log Info "${bin_name} 订阅更新: ${update_subscription}."
       fi
     fi
-    cat "${box_dir}/crontab.cfg" >> "${box_run}/root"
-    chmod 0644 "${box_run}/root"
-    nohup busybox crond -c "${box_run}" >/dev/null 2>&1 &
+    cat "${box_dir}/crontab.cfg" >> "${box_run_state}/root"
+    chmod 0644 "${box_run_state}/root"
+    nohup busybox crond -c "${box_run_state}" >/dev/null 2>&1 &
   else
     log Info "crond 已禁用"
   fi
@@ -433,7 +459,7 @@ box_run_bin() {
   ulimit -SHn 1000000
 
   # 启动服务前刷新 box.tool 日志
-  : > "/data/adb/box/run/tool.log"
+  : > "${box_run}/tool.log"
 
   case "${bin_name}" in
     hysteria)
@@ -525,7 +551,7 @@ box_run_bin() {
       ;;
     v2fly)
       if [[ "${network_mode}" != "tproxy" ]]; then
-        sed -i 's/\(network_mode=\)"[^\"]*"/\1"tproxy"/g' ${settings}
+        sed -i 's/\(network_mode=\)"[^"]*"/\1"tproxy"/g' ${settings}
       fi
       if [ ! -f "${v2fly_config}" ]; then
         log Error "未找到配置文件：${v2fly_config}"
@@ -660,9 +686,10 @@ set_description() {
   local error_msg="$2"
   local desc=""
   local ipv6_info=""
-  local wifissid_str=""
+  local wifi_match_str=""
   local ssid_mode_str=""
-  local ssid_list_str=""
+  local ssid_count=0
+  local bssid_count=0
 
   # IPv6状态
   if [ "${ipv6}" = "true" ]; then
@@ -671,7 +698,7 @@ set_description() {
     ipv6_info="未启用"
   fi
 
-  # 仅在服务运行且启用网络控制且开启 WiFi SSID 匹配时显示
+  # 仅在服务运行且启用网络控制且开启 WiFi 匹配（SSID/BSSID）时显示
   if [ "$status" = "running" ] && [ "${enable_network_service_control}" = "true" ] && [ "${use_ssid_matching}" = "true" ]; then
     # 判断黑白名单模式
     if [ "${use_wifi_list_mode}" = "blacklist" ]; then
@@ -681,24 +708,22 @@ set_description() {
     else
       ssid_mode_str="未知模式"
     fi
-    # 使用引号和逗号分隔来处理包含空格的SSID，与日志格式保持一致
-    ssid_list_str=""
+    ssid_count=0
     for ssid_item in "${wifi_ssids_list[@]}"; do
-      if [ -z "$ssid_list_str" ]; then
-        ssid_list_str="'$ssid_item'"
-      else
-        ssid_list_str="$ssid_list_str, '$ssid_item'"
-      fi
+      [ -n "$ssid_item" ] && ssid_count=$((ssid_count + 1))
     done
-    # 仅当 SSID 列表非空时才显示
-    if [ -n "$ssid_list_str" ]; then
-      wifissid_str=" | WiFi SSID列表（${ssid_mode_str}）: [$ssid_list_str]"
-    fi
+
+    bssid_count=0
+    for bssid_item in "${wifi_bssids_list[@]}"; do
+      [ -n "$bssid_item" ] && bssid_count=$((bssid_count + 1))
+    done
+
+    wifi_match_str=" | WiFi匹配（${ssid_mode_str}）SSID:${ssid_count} BSSID:${bssid_count}"
   fi
 
   case "$status" in
     running)
-      desc="✅ Box服务运行中 | 内核: ${bin_name} | 代理模式: ${proxy_mode} | 网络: ${network_mode} | IPv6状态: ${ipv6_info} | DNS模式: ${dns_mode}${wifissid_str}"
+      desc="✅ Box服务运行中 | 内核: ${bin_name} | 代理模式: ${proxy_mode} | 网络: ${network_mode} | IPv6状态: ${ipv6_info} | DNS模式: ${dns_mode}${wifi_match_str}"
       ;;
     stopped)
       desc="❌ Box服务已停止 | 上次运行内核: ${bin_name} | 代理已禁用"

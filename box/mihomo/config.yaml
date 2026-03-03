@@ -37,7 +37,7 @@ unified-delay: false
 tcp-concurrent: true
 log-level: error
 find-process-mode: always
-global-client-fingerprint: random
+# global-client-fingerprint: random
 external-controller: 0.0.0.0:9090
 external-ui: ./dashboard
 

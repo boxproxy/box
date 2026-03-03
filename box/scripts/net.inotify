@@ -26,28 +26,78 @@ fi
 iptables="${IPV}"
 ip6tables="${IP6V}"
 logs="/data/adb/box/run"
+log_file="${logs}/net.log"
+
+log_info() {
+  mkdir -p "${logs}" >/dev/null 2>&1 || true
+  echo "[$(date '+%F %T')] [Info]: $*" >> "${log_file}" 2>&1
+}
+
+log_reset() {
+  mkdir -p "${logs}" >/dev/null 2>&1 || true
+  : > "${log_file}" 2>&1 || true
+}
+
+with_lock_or_skip() {
+  local lock_dir="/data/adb/box/run/locks/net_inotify.lock"
+  mkdir -p "${logs}" "/data/adb/box/run/locks" >/dev/null 2>&1 || true
+  if ! mkdir "${lock_dir}" >/dev/null 2>&1; then
+    return 1
+  fi
+  trap 'rmdir "${lock_dir}" >/dev/null 2>&1 || true' EXIT
+  return 0
+}
+
+chain_exists() {
+  local ipt_cmd="$1"
+  local table_name="$2"
+  local chain_name="$3"
+  ${ipt_cmd} -t "${table_name}" -L "${chain_name}" >/dev/null 2>&1
+}
+
+ensure_chain_and_flush() {
+  local ipt_cmd="$1"
+  local table_name="$2"
+  local chain_name="$3"
+  ${ipt_cmd} -t "${table_name}" -N "${chain_name}" >/dev/null 2>&1 || true
+  ${ipt_cmd} -t "${table_name}" -F "${chain_name}" >/dev/null 2>&1 || true
+}
+
+ensure_rule_append() {
+  local ipt_cmd="$1"
+  local table_name="$2"
+  local chain_name="$3"
+  shift 3
+  if ! ${ipt_cmd} -t "${table_name}" -C "${chain_name}" "$@" >/dev/null 2>&1; then
+    ${ipt_cmd} -t "${table_name}" -A "${chain_name}" "$@" >/dev/null 2>&1 || true
+  fi
+}
 
 rules_add() {
-  date > "${logs}/net.log"
-  iptables -t mangle -F LOCAL_IP_V4
-  ip -4 a | busybox awk '/inet/ {print $2}' | grep -vE "^127\.0\.0\.1" | while read -r local_ipv4 ; do
-    ${iptables} -t mangle -A LOCAL_IP_V4 -d $local_ipv4 -j ACCEPT
-    rv1=$?
-    ${iptables} -t nat -A LOCAL_IP_V4 -d $local_ipv4 -j ACCEPT
-    rv2=$?
-    ( [ $rv1 = "0" ] || [ $rv2 = "0" ] ) && echo "[Info]: 本地IP $local_ipv4，防环回规则已插入" >> ${logs}/net.log 2>&1
+  mkdir -p "${logs}" >/dev/null 2>&1 || true
+
+  ensure_chain_and_flush "${iptables}" mangle LOCAL_IP_V4
+  ensure_chain_and_flush "${iptables}" nat LOCAL_IP_V4
+
+  ip -4 a | busybox awk '/inet/ {print $2}' | busybox sort -u | busybox grep -vE "^127\\.0\\.0\\.1" | while read -r local_ipv4 ; do
+    ensure_rule_append "${iptables}" mangle LOCAL_IP_V4 -d "${local_ipv4}" -j ACCEPT
+    ensure_rule_append "${iptables}" nat LOCAL_IP_V4 -d "${local_ipv4}" -j ACCEPT
+    log_info "本地IP ${local_ipv4}，防环回规则已更新"
   done
 
-  ip6tables -t mangle -F LOCAL_IP_V6
-  ip -6 a | busybox awk '/inet6/ {print $2}' | grep -vE "^fe80|^::1|^fd00" | while read -r local_ipv6 ; do
-    ${ip6tables} -t mangle -A LOCAL_IP_V6 -d $local_ipv6 -j ACCEPT
-    [ $? = "0" ] && echo "[Info]: 本地IP $local_ipv6，防环回规则已插入" >> ${logs}/net.log 2>&1
+  ensure_chain_and_flush "${ip6tables}" mangle LOCAL_IP_V6
+  ip -6 a | busybox awk '/inet6/ {print $2}' | busybox sort -u | busybox grep -vE "^fe80|^::1|^fd00" | while read -r local_ipv6 ; do
+    ensure_rule_append "${ip6tables}" mangle LOCAL_IP_V6 -d "${local_ipv6}" -j ACCEPT
+    log_info "本地IP ${local_ipv6}，防环回规则已更新"
   done
 }
 
 if [ "$events" = "w" ]; then
   # 只有 box.pid 存在时才执行原有规则
   if [ -f "/data/adb/box/run/box.pid" ]; then
-    rules_add
+    if with_lock_or_skip; then
+      log_reset
+      rules_add
+    fi
   fi
 fi

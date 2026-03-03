@@ -1,13 +1,35 @@
 #!/system/bin/sh
 
+# shellcheck disable=SC2039
+
+get_wifi_iface() {
+  local iface
+
+  iface=$(ip route 2>/dev/null | busybox awk '$1=="default" {print $5; exit}')
+  if [ -n "$iface" ] && ip link show "$iface" >/dev/null 2>&1; then
+    echo "$iface"
+    return 0
+  fi
+
+  iface=$(ip link 2>/dev/null | busybox awk -F': ' '/: (wlan|swlan)[0-9]+/ {print $2; exit}')
+  if [ -n "$iface" ] && ip link show "$iface" >/dev/null 2>&1; then
+    echo "$iface"
+    return 0
+  fi
+
+  echo "wlan0"
+}
+
 # 获取当前 WiFi SSID
 get_current_ssid() {
   local ssid
+  local iface
+  iface=$(get_wifi_iface)
   
   ssid=$(cmd wifi status 2>/dev/null | sed -n 's/.*SSID: "\([^"]*\)".*/\1/p' | head -n1)
   
   if [ -z "$ssid" ] || [ "$ssid" = "<unknown ssid>" ]; then
-    ssid=$(iwconfig wlan0 2>/dev/null | busybox awk -F'ESSID:' '{print $2}' | tr -d '"' | busybox awk '{print $1}')
+    ssid=$(iwconfig "$iface" 2>/dev/null | busybox awk -F'ESSID:' '{print $2}' | tr -d '"' | busybox awk '{print $1}')
   fi
   
   if [ -z "$ssid" ] || [ "$ssid" = "off/any" ]; then
@@ -17,18 +39,48 @@ get_current_ssid() {
   fi
 }
 
+# 获取当前 WiFi BSSID
+get_current_bssid() {
+  local bssid
+  local iface
+  iface=$(get_wifi_iface)
+
+  bssid=$(cmd wifi status 2>/dev/null | sed -n 's/.*BSSID: \([0-9a-fA-F:][0-9a-fA-F:]*\).*/\1/p' | head -n1)
+
+  if [ -z "$bssid" ] || [ "$bssid" = "<none>" ]; then
+    bssid=$(iw dev "$iface" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-fA-F:][0-9a-fA-F:]*\).*/\1/p' | head -n1)
+  fi
+
+  if [ -z "$bssid" ] || [ "$bssid" = "Not-Associated" ]; then
+    bssid=$(iwconfig "$iface" 2>/dev/null | sed -n 's/.*Access Point: \([0-9A-Fa-f:][0-9A-Fa-f:]*\).*/\1/p' | head -n1)
+  fi
+
+  if [ -z "$bssid" ] || [ "$bssid" = "00:00:00:00:00:00" ]; then
+    echo "unknown"
+  else
+    echo "$bssid"
+  fi
+}
+
 # 检查 WiFi 是否连接
 is_wifi_connected() {
-  if ip addr show wlan0 2>/dev/null | grep -q 'inet '; then
+  local iface
+  iface=$(get_wifi_iface)
+
+  if ip addr show "$iface" 2>/dev/null | grep -Eq 'inet6? '; then
     echo "wifi"
-  else
-    echo "not_wifi"
+    return 0
   fi
+
+  echo "not_wifi"
 }
 
 # 获取 WiFi IP 地址
 get_wifi_ip() {
-  ip addr show wlan0 2>/dev/null | busybox awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+  local iface
+  iface=$(get_wifi_iface)
+
+  ip addr show "$iface" 2>/dev/null | busybox awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
 }
 
 # 检查 SSID 是否在列表中
@@ -43,10 +95,24 @@ is_ssid_in_list() {
   return 1
 }
 
+# 检查 BSSID 是否在列表中
+is_bssid_in_list() {
+  local bssid="$1"
+  local item
+
+  for item in "${wifi_bssids_list[@]}"; do
+    [ "$bssid" = "$item" ] && return 0
+  done
+
+  return 1
+}
+
 # 判断是否应该启用服务
 should_enable_service() {
   local wifi_status="$1"
   local ssid="$2"
+  local bssid="$3"
+  local matched="false"
   
   if [ "$wifi_status" = "not_wifi" ]; then
     [ "$use_module_on_wifi_disconnect" = "true" ] && return 0 || return 1
@@ -57,7 +123,13 @@ should_enable_service() {
   fi
   
   if [ "$use_ssid_matching" = "true" ]; then
-    if is_ssid_in_list "$ssid"; then
+    if [ -n "${wifi_bssids_list[*]}" ] && [ "$bssid" != "unknown" ]; then
+      is_bssid_in_list "$bssid" && matched="true" || matched="false"
+    else
+      [ -n "${wifi_ssids_list[*]}" ] && is_ssid_in_list "$ssid" && matched="true" || matched="false"
+    fi
+
+    if [ "$matched" = "true" ]; then
       [ "$use_wifi_list_mode" = "whitelist" ] && return 0 || return 1
     else
       [ "$use_wifi_list_mode" = "whitelist" ] && return 1 || return 0

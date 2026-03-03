@@ -24,7 +24,7 @@ service_control() {
   fi
 }
 
-mkdir -p "${run_path}"
+mkdir -p "${run_path}" >/dev/null 2>&1 || true
 if [ -f "${file_settings}" ] && [ -r "${file_settings}" ] && [ -s "${file_settings}" ]; then
   service_control
 else

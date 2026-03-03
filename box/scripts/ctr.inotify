@@ -6,8 +6,8 @@ BASE_DIR="/data/adb/box"
 LOG_DIR="${BASE_DIR}/run"
 SCRIPTS_DIR="$(dirname "$(realpath "$0")")"
 LOG_FILE="${LOG_DIR}/netswitch.log"
-STATE_FILE="${LOG_DIR}/last_check_time"
-WIFI_STATE_FILE="${LOG_DIR}/last_wifi_state"
+STATE_FILE="${BASE_DIR}/run/state/last_check_time"
+WIFI_STATE_FILE="${BASE_DIR}/run/state/last_wifi_state"
 STABILITY_WINDOW=3
 
 [ "$1" != "w" ] && exit 0
@@ -17,6 +17,7 @@ source "${BASE_DIR}/settings.ini"
 source "${SCRIPTS_DIR}/ctr.utils"
 
 mkdir -p "$RUN_DIR"
+mkdir -p "${LOG_DIR}" "${BASE_DIR}/run/state" >/dev/null 2>&1 || true
 
 log_msg() {
   [ "$inotify_log_enabled" = "true" ] || return 0
@@ -52,7 +53,10 @@ is_service_running() {
 }
 
 start_service() {
-  is_service_running && return 0
+  if is_service_running; then
+    log_msg "[跳过] 服务已在运行"
+    return 0
+  fi
   
   "${SCRIPTS_DIR}/box.service" start
   "${SCRIPTS_DIR}/box.iptables" enable
@@ -60,7 +64,10 @@ start_service() {
 }
 
 stop_service() {
-  is_service_running || return 0
+  if ! is_service_running; then
+    log_msg "[跳过] 服务已停止"
+    return 0
+  fi
   
   "${SCRIPTS_DIR}/box.iptables" disable
   "${SCRIPTS_DIR}/box.service" stop
@@ -69,10 +76,12 @@ stop_service() {
 
 save_wifi_state() {
   local ssid="$1"
-  local ip="$2"
+  local bssid="$2"
+  local ip="$3"
   
   cat > "$WIFI_STATE_FILE" <<-EOF
 	ssid:${ssid}
+	bssid:${bssid}
 	ip:${ip}
 	EOF
 }
@@ -83,6 +92,7 @@ main() {
   
   local wifi_status=$(is_wifi_connected)
   local ssid=$(get_current_ssid)
+  local bssid=$(get_current_bssid)
   local wifi_ip
   
   log_msg "--- 网络状态检查 ---"
@@ -100,14 +110,14 @@ main() {
       exit 0
     fi
     
-    log_msg "WiFi: ${ssid}, IP: ${wifi_ip}"
-    save_wifi_state "$ssid" "$wifi_ip"
+    log_msg "WiFi: ${ssid}, BSSID: ${bssid}, IP: ${wifi_ip}"
+    save_wifi_state "$ssid" "$bssid" "$wifi_ip"
   else
     log_msg "WiFi: 已断开"
   fi
   
   # 判断是否应该启用服务
-  if should_enable_service "$wifi_status" "$ssid"; then
+  if should_enable_service "$wifi_status" "$ssid" "$bssid"; then
     log_msg "策略: 启用服务"
     start_service
   else
@@ -115,7 +125,7 @@ main() {
     stop_service
   fi
   
-  log_msg "操作完成"
+  log_msg "完成"
 }
 
 main
