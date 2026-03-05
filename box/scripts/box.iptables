@@ -821,7 +821,7 @@ start_tproxy() {
         ensure_rule_append mangle BOX_EXTERNAL -p udp --dport 53 -j RETURN
       fi
   else
-      if [ "${mihomo_dns_forward}" = "enable" ] && [[ "${bin_name}" == @(mihomo|hysteria) ]] ; then
+      if [ "${mihomo_dns_forward}" = "enable" ] && [[ "${bin_name}" == @(mihomo|sing-box) ]] ; then
         if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
           ensure_rule_append mangle BOX_EXTERNAL -p tcp --dport 53 -j RETURN
         fi
@@ -973,7 +973,7 @@ start_tproxy() {
         ensure_rule_append mangle BOX_LOCAL -p udp --dport 53 -j RETURN
       fi
   else
-      if [ "${mihomo_dns_forward}" = "enable" ] && [[ "${bin_name}" == @(mihomo|hysteria) ]] ; then
+      if [ "${mihomo_dns_forward}" = "enable" ] && [[ "${bin_name}" == @(mihomo|sing-box) ]] ; then
         if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
           ensure_rule_append mangle BOX_LOCAL -p tcp --dport 53 -j RETURN
         fi
@@ -1143,7 +1143,7 @@ fi
       _dns_port="${mihomo_dns_port}"
       [ -z "${_dns_port}" ] && _dns_port="1053"
       setup_nat_dns_hijack "NAT_DNS_HIJACK" "${_dns_port}" "4"
-    elif [ "${mihomo_dns_forward}" = "enable" ] && [ "${bin_name}" = "mihomo" ]; then
+    elif [ "${mihomo_dns_forward}" = "enable" ] && [ "${bin_name}" = @(mihomo|sing-box) ]; then
       ensure_chain nat MIHOMO_DNS_EXTERNAL
       ensure_rule_append nat MIHOMO_DNS_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${mihomo_dns_port}"
       ensure_jump nat PREROUTING MIHOMO_DNS_EXTERNAL

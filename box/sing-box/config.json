@@ -12,6 +12,14 @@
         "server": "223.5.5.5"
       }
     ],
+    "inbounds": [
+      {
+        "type": "direct",
+        "tag": "dns_in",
+        "listen": "::",
+        "listen_port": 1053
+      }
+    ],
     "rules": [
       {
         "rule_set": "geosite-geolocation-cn",
@@ -34,6 +42,12 @@
     ]
   },
   "route": {
+    "rules": [
+      {
+        "inbound": "dns_in",
+        "action": "hijack-dns"
+      }
+    ],
     "default_domain_resolver": "local",
     "rule_set": [
       {
