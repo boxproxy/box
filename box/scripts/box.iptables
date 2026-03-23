@@ -30,6 +30,37 @@ if [ "$buildVersionMajor" -ge "$minBuildVersion" ]; then
   IP6V="ip6tables -w 100"
 fi
 
+# coloros google通用规则清理底层函数
+clean_coloros_chain_rules() {
+    local ipt_cmd="$1"  # 接收 iptables 或 ip6tables
+    local chain="$2"    # 接收链名称，如 fw_INPUT
+    local keyword="$3"  # 接收匹配关键字
+
+    # 提取包含关键字的行号并倒序排列 (防止删除时行号错位)
+    local lines=$($ipt_cmd -t filter -nvL "$chain" --line-numbers 2>/dev/null | grep "$keyword" | awk '{print $1}' | sort -nr)
+
+    if [ -n "$lines" ]; then
+        for line in $lines; do
+            log Info "发现coloros拦截规则，执行删除: $ipt_cmd -t filter -D $chain $line"
+            $ipt_cmd -t filter -D "$chain" "$line"
+        done
+    fi
+}
+
+# 监测并清理 coloros网络限制规则
+check_and_clean_coloros_rules() {
+    # 将变量放到函数内部作为局部变量 (使用 local 声明，不污染全局环境)
+    local TARGET_KEYWORD="prog_oplus-netd_skfilter_reject_qcom_uid"
+
+    # 1. 检查并清理 IPv4 规则
+    clean_coloros_chain_rules "iptables" "fw_INPUT" "$TARGET_KEYWORD"
+    clean_coloros_chain_rules "iptables" "fw_OUTPUT" "$TARGET_KEYWORD"
+    
+    # 2. 检查并清理 IPv6 规则
+    clean_coloros_chain_rules "ip6tables" "fw_INPUT" "$TARGET_KEYWORD"
+    clean_coloros_chain_rules "ip6tables" "fw_OUTPUT" "$TARGET_KEYWORD"
+}
+
 chain_exists() {
   local table_name="$1"
   local chain_name="$2"
@@ -1286,6 +1317,7 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
       }
       log_iptables_results
       cleanup_iptables
+      check_and_clean_coloros_rules
 
       # 准备大陆 IP 分流 ipset
       if [ "${bypass_cn_ip}" = "true" ]; then
