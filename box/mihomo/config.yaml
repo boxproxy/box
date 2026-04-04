@@ -6,7 +6,7 @@ proxy-providers:
     type: http
     url: "填写订阅链接"
     path: ./proxy_provider/proxy1.yaml
-    interval: 3600
+    interval: 86400
     health-check:
       enable: true
       url: https://cp.cloudflare.com
@@ -18,7 +18,7 @@ proxy-providers:
   #   type: http
   #   url: "填写订阅链接"
   #   path: ./proxy_provider/proxy2.yaml
-  #   interval: 3600
+  #   interval: 86400
   #   health-check:
   #     enable: true
   #     url: https://cp.cloudflare.com

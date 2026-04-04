@@ -299,7 +299,7 @@ if [ "${backup_box}" = "true" ]; then
   done
 
   ui_print "  - 恢复根目录配置文件"
-  for conf_file in ap.list.cfg package.list.cfg crontab.cfg; do
+  for conf_file in ap.list.cfg package.list.cfg gid.list.cfg crontab.cfg; do
     if [ -f "${temp_dir}/${conf_file}" ]; then
       cp -f "${temp_dir}/${conf_file}" "/data/adb/box/${conf_file}"
     fi

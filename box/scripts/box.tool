@@ -419,23 +419,32 @@ update_mihomo_providers() {
   for i in $(seq 0 $((file_count - 1))); do
     local file_name="${name_provide_mihomo_config[$i]}"
     local provider_file="${mihomo_provide_path}/${file_name}"
-    local provider_name="${file_name%.yaml}"    
-    
-    [ ! -f "${provider_file}" ] && log Warning "订阅文件不存在，跳过: ${provider_file}" && continue
+    local provider_name="${file_name%.yaml}"
+    local provider_url="${subscription_url_mihomo[$i]}"
+    local escaped_url
+
+    if [ -z "${provider_url}" ]; then
+      log Warning "订阅链接为空，跳过: ${provider_name}"
+      continue
+    fi
+    escaped_url="$(echo "${provider_url}" | busybox sed 's/\\/\\\\/g; s/\"/\\"/g')"
     
     local relative_path
-    if command -v realpath >/dev/null 2>&1; then
+    if command -v realpath >/dev/null 2>&1 && [ -e "${provider_file}" ]; then
       relative_path="$(realpath --relative-to="${config_dir}" "${provider_file}")"
+      [ -z "${relative_path}" ] && relative_path="./$(basename "${mihomo_provide_path}")/${file_name}"
     else
       relative_path="./$(basename "${mihomo_provide_path}")/${file_name}"
     fi
 
-    log Debug "添加 provider: ${provider_name} -> ${relative_path}"
+    log Debug "添加 provider: ${provider_name} -> ${relative_path} (http)"
     
     cat >> "${temp_providers}" <<EOF
   ${provider_name}:
-    type: file
+    type: http
+    url: "${escaped_url}"
     path: ${relative_path}
+    interval: 86400
     health-check:
       enable: true
       url: https://cp.cloudflare.com
