@@ -79,6 +79,16 @@ ensure_rule_append() {
   ${ipt_cmd} -t "${table_name}" -A "${chain_name}" "$@" >/dev/null 2>&1
 }
 
+# 等待 tun 接口
+until ip link show sing >/dev/null 2>&1; do sleep 0.5; done
+
+# 在路由表 8000 中添加默认路由
+ip -6 route add default dev sing table 8000 metric 1
+
+# 添加高优先级的策略路由规则：所有 IPv6 流量都查表 8000
+ip -6 rule add from all lookup 8000 priority 1000 2>/dev/null
+ip -6 rule add fwmark 0x8000/0x8000 lookup 8000 priority 1001 2>/dev/null
+
 rules_add() {
   mkdir -p "${logs}" >/dev/null 2>&1 || true
 

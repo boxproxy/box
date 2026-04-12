@@ -1,0 +1,428 @@
+#!/system/bin/sh
+# box.monitor — 核心监控守护脚本
+# 支持：无网络自动重启 / CPU 占用过高自动重启 / 定时重启
+# 通过 settings.ini 中以下选项控制：
+#
+#   enable_network_watchdog="true"       # 启用无网络自动重启
+#   network_watchdog_timeout=5           # 连续 N 次检测失败后重启
+#   network_test_host="https://cp.cloudflare.com"
+#   network_check_interval="60"          # 检测间隔（秒），最小 10s
+#
+#   enable_cpu_watchdog="false"          # 启用 CPU 占用过高自动重启
+#   cpu_watchdog_threshold=90            # CPU 占用超过 N% 触发计时
+#   cpu_watchdog_duration=120            # 持续超标秒数达到此值后重启
+#
+#   enable_scheduled_restart="false"     # 启用定时重启
+#   scheduled_restart_cron="0 4 * * *"  # cron 表达式，默认每天凌晨 4:00
+
+scripts_dir="${0%/*}"
+source /data/adb/box/settings.ini
+
+# ── 默认值 ────────────────────────────────────────────────────────────────
+enable_network_watchdog="${enable_network_watchdog:-true}"
+network_watchdog_timeout="${network_watchdog_timeout:-5}"
+network_test_host="${network_test_host:-https://cp.cloudflare.com}"
+network_check_interval="${network_check_interval:-60}"
+
+enable_cpu_watchdog="${enable_cpu_watchdog:-false}"
+cpu_watchdog_threshold="${cpu_watchdog_threshold:-90}"
+cpu_watchdog_duration="${cpu_watchdog_duration:-120}"
+
+enable_scheduled_restart="${enable_scheduled_restart:-false}"
+scheduled_restart_cron="${scheduled_restart_cron:-0 4 * * *}"
+
+# 强制最小间隔 10s
+[ "${network_check_interval}" -lt 10 ] 2>/dev/null && network_check_interval=10
+
+# ── 状态文件路径 ───────────────────────────────────────────────────────────
+MONITOR_STATE_DIR="${box_run_state}"
+NO_NET_COUNT_FILE="${MONITOR_STATE_DIR}/monitor.nonet.count"
+CPU_HIGH_START_FILE="${MONITOR_STATE_DIR}/monitor.cpu_high.start"
+MONITOR_LOG="${box_run}/monitor.log"
+DAEMON_PID_FILE="${MONITOR_STATE_DIR}/monitor.daemon.pid"
+
+# ── 日志函数 ───────────────────────────────────────────────────────────────
+# 日志级别权重：数字越大越严重
+_mlog_level_weight() {
+  case "$1" in
+    Info)    echo 1 ;;
+    Warning) echo 2 ;;
+    Error)   echo 3 ;;
+    *)       echo 0 ;;
+  esac
+}
+
+_mlog() {
+  local level="$1"; shift
+  local ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  local msg="${ts} [${level}]: (monitor) $*"
+
+  # monitor.log：始终全量写入
+  echo "${msg}" >> "${MONITOR_LOG}"
+
+  # runs.log：按 monitor_runs_log_level 过滤
+  # 可选值: all(默认) / warning / error / none
+  local runs_filter="${monitor_runs_log_level:-all}"
+  local write_runs=false
+  case "${runs_filter}" in
+    all)     write_runs=true ;;
+    warning) [ "$(_mlog_level_weight "${level}")" -ge 2 ] && write_runs=true ;;
+    error)   [ "$(_mlog_level_weight "${level}")" -ge 3 ] && write_runs=true ;;
+    none)    write_runs=false ;;
+    *)       write_runs=true ;;
+  esac
+  [ "${write_runs}" = "true" ] && echo "${msg}" >> "${box_log}"
+
+  if [ -t 1 ]; then
+    log "${level}" "(monitor) $*" 2>/dev/null || true
+  fi
+}
+
+_mlog_divider() {
+  local line="$(date '+%Y-%m-%d %H:%M:%S') ────────────────────────────────────"
+  echo "${line}" >> "${MONITOR_LOG}"
+  # 分隔线也遵守过滤规则：仅在 all 时写入 runs.log
+  [ "${monitor_runs_log_level:-all}" = "all" ] && echo "${line}" >> "${box_log}"
+}
+
+# 强制写入 runs.log（无视 monitor_runs_log_level，用于重要的启动摘要和状态恢复）
+_mlog_force() {
+  local level="$1"; shift
+  local ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  local msg="${ts} [${level}]: (monitor) $*"
+  echo "${msg}" >> "${MONITOR_LOG}"
+  echo "${msg}" >> "${box_log}"
+  if [ -t 1 ]; then
+    log "${level}" "(monitor) $*" 2>/dev/null || true
+  fi
+}
+
+# 限制 monitor.log 大小（保留最后 500 行）
+_trim_log() {
+  if [ -f "${MONITOR_LOG}" ] && [ "$(busybox wc -l < "${MONITOR_LOG}" 2>/dev/null)" -gt 600 ]; then
+    local tmp="${MONITOR_LOG}.tmp"
+    tail -500 "${MONITOR_LOG}" > "${tmp}" && mv "${tmp}" "${MONITOR_LOG}"
+  fi
+}
+
+# ── cron 表达式转中文 ──────────────────────────────────────────────────────
+_cron_to_human() {
+  local expr="$1"
+  local m h dom mon dow
+  m="$(echo "${expr}"   | busybox awk '{print $1}')"
+  h="$(echo "${expr}"   | busybox awk '{print $2}')"
+  dom="$(echo "${expr}" | busybox awk '{print $3}')"
+  mon="$(echo "${expr}" | busybox awk '{print $4}')"
+  dow="$(echo "${expr}" | busybox awk '{print $5}')"
+
+  # 仅处理常见模式，其余原样返回
+  # 每 N 分钟: */N * * * *
+  if echo "${m}" | grep -qE '^\*/[0-9]+$' && [ "${h}" = "*" ] && [ "${dom}" = "*" ] && [ "${mon}" = "*" ] && [ "${dow}" = "*" ]; then
+    local n="${m#*/}"
+    echo "每${n}分钟"
+    return
+  fi
+  # 每小时整点: 0 * * * *
+  if [ "${m}" = "0" ] && [ "${h}" = "*" ] && [ "${dom}" = "*" ] && [ "${mon}" = "*" ] && [ "${dow}" = "*" ]; then
+    echo "每小时整点"
+    return
+  fi
+  # 每 N 小时: 0 */N * * *
+  if [ "${m}" = "0" ] && echo "${h}" | grep -qE '^\*/[0-9]+$' && [ "${dom}" = "*" ] && [ "${mon}" = "*" ] && [ "${dow}" = "*" ]; then
+    local n="${h#*/}"
+    echo "每${n}小时"
+    return
+  fi
+  # 每天固定时刻: 0 H * * *（H 为数字）
+  if [ "${m}" = "0" ] && echo "${h}" | grep -qE '^[0-9]+$' && [ "${dom}" = "*" ] && [ "${mon}" = "*" ] && [ "${dow}" = "*" ]; then
+    local hh
+    hh=$(printf "%02d" "${h}")
+    echo "每天 ${hh}:00"
+    return
+  fi
+  # 每天多个时刻: 0 H1,H2,... * * *
+  if [ "${m}" = "0" ] && echo "${h}" | grep -qE '^[0-9]+(,[0-9]+)+$' && [ "${dom}" = "*" ] && [ "${mon}" = "*" ] && [ "${dow}" = "*" ]; then
+    local times=""
+    for hh in $(echo "${h}" | tr ',' ' '); do
+      times="${times}$(printf "%02d" "${hh}"):00 "
+    done
+    echo "每天 ${times% }"
+    return
+  fi
+  # 每 N 分钟（非整除型）: M */H * * * 或其他复杂形式 → 原样
+  echo "${expr}"
+}
+
+# ── 启动摘要 ───────────────────────────────────────────────────────────────
+_log_startup_summary() {
+  local pid
+  pid=$(busybox pidof "${bin_name}" 2>/dev/null | busybox awk '{print $1}')
+  local core_state
+  [ -n "${pid}" ] && core_state="运行中 (PID: ${pid})" || core_state="未运行"
+
+  local sched_human
+  sched_human="$(_cron_to_human "${scheduled_restart_cron}")"
+
+  _mlog_divider
+  _mlog Info "▶ 检查 | ${bin_name}[${core_state}] | 网络:${enable_network_watchdog} CPU:${enable_cpu_watchdog} 定时重启:${enable_scheduled_restart}(${sched_human})"
+}
+
+# ── 重启核心（调用 box.service restart-core，不杀死监控守护）────────────────
+_restart_core() {
+  local reason="$1"
+
+  # ── 并发锁：防止多个触发源同时重启（锁超过 120s 视为过期）───────────
+  local RESTART_LOCK="${MONITOR_STATE_DIR}/restart.lock"
+  if [ -f "${RESTART_LOCK}" ]; then
+    local lock_age lock_ts
+    lock_ts=$(cat "${RESTART_LOCK}" 2>/dev/null || echo 0)
+    lock_age=$(( $(date +%s) - lock_ts ))
+    if [ "${lock_age}" -lt 120 ]; then
+      _mlog Warning "重启已在进行中 (${lock_age}s)，跳过: ${reason}"
+      return 0
+    fi
+    _mlog Warning "发现过期锁 (${lock_age}s)，强制清除"
+  fi
+  date +%s > "${RESTART_LOCK}"
+
+  _mlog_divider
+  _mlog Warning "⚡ 重启 ${bin_name} | 原因: ${reason}"
+
+  # 直接传递原因参数给 box.service restart-core
+  "${scripts_dir}/box.service" restart-core "${reason}" >> "${MONITOR_LOG}" 2>&1
+
+  rm -f "${NO_NET_COUNT_FILE}" "${CPU_HIGH_START_FILE}" "${RESTART_LOCK}"
+  _mlog_divider
+}
+
+# ── 1. 无网络检测 ──────────────────────────────────────────────────────────
+check_network() {
+  [ "${enable_network_watchdog}" = "true" ] || return 0
+
+  local pid
+  pid=$(busybox pidof "${bin_name}" 2>/dev/null | busybox awk '{print $1}')
+  if [ -z "${pid}" ]; then
+    _mlog Warning "网络监控: 核心 ${bin_name} 未运行，跳过检测"
+    return 0
+  fi
+
+  local http_code
+  if command -v curl >/dev/null 2>&1; then
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --insecure "${network_test_host}" 2>/dev/null)
+  else
+    http_code=$(busybox wget -T 5 -q --spider "${network_test_host}" 2>/dev/null && echo "200" || echo "000")
+  fi
+
+  if [ "${http_code}" = "204" ] || [ "${http_code}" = "200" ]; then
+    if [ -f "${NO_NET_COUNT_FILE}" ]; then
+      local prev_count
+      prev_count=$(cat "${NO_NET_COUNT_FILE}" 2>/dev/null || echo 0)
+      _mlog_force Info "网络监控: ✓ 已恢复 (HTTP ${http_code}) | 此前累计失败 ${prev_count} 次"
+      rm -f "${NO_NET_COUNT_FILE}"
+    fi
+    # 正常时不重复记录，降低日志噪音
+    return 0
+  fi
+
+  local count=0
+  [ -f "${NO_NET_COUNT_FILE}" ] && count=$(cat "${NO_NET_COUNT_FILE}" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "${count}" > "${NO_NET_COUNT_FILE}"
+
+  local remain=$((network_watchdog_timeout - count))
+  if [ "${count}" -ge "${network_watchdog_timeout}" ]; then
+    _mlog Warning "网络监控: ✗ HTTP ${http_code:-000} | 累计: ${count}/${network_watchdog_timeout} | 触发重启..."
+    _restart_core "连续 ${count} 次网络检测失败 (HTTP ${http_code:-000})"
+  else
+    _mlog Warning "网络监控: ✗ HTTP ${http_code:-000} | 累计: ${count}/${network_watchdog_timeout} | 还需失败 ${remain} 次"
+  fi
+}
+
+# ── 获取进程瞬时 CPU 占用（per-core 百分比，与 ps/top/进程监控显示一致）────
+# 原理：对 /proc/<pid>/stat 和 /proc/stat 做 1 秒双采样，计算真实瞬时占用。
+# 避免 ps %cpu 使用"启动以来累计平均值"导致的严重低估问题。
+# 返回值：整数百分比（单核满载=100%，多核可超过100%），失败时返回空字符串。
+_get_proc_cpu() {
+  local pid="$1"
+  local stat_file="/proc/${pid}/stat"
+  [ -f "${stat_file}" ] || { echo ""; return 1; }
+
+  # ── T1 采样 ────────────────────────────────────────────────────────────
+  local p1 t1
+  p1=$(busybox awk '{print $14+$15}' "${stat_file}" 2>/dev/null)
+  t1=$(busybox awk 'NR==1{s=0; for(i=2;i<=NF;i++) s+=$i; print s}' /proc/stat 2>/dev/null)
+  [ -z "${p1}" ] || [ -z "${t1}" ] && { echo ""; return 1; }
+
+  sleep 1
+
+  # ── T2 采样（sleep 期间进程可能退出）──────────────────────────────────
+  [ -f "${stat_file}" ] || { echo ""; return 1; }
+  local p2 t2
+  p2=$(busybox awk '{print $14+$15}' "${stat_file}" 2>/dev/null)
+  t2=$(busybox awk 'NR==1{s=0; for(i=2;i<=NF;i++) s+=$i; print s}' /proc/stat 2>/dev/null)
+  [ -z "${p2}" ] || [ -z "${t2}" ] && { echo ""; return 1; }
+
+  local dp dt nproc
+  dp=$(( p2 - p1 ))
+  dt=$(( t2 - t1 ))
+  [ "${dt}" -le 0 ] && { echo ""; return 1; }
+
+  # 核心数，用于换算 per-core 百分比
+  nproc=$(busybox nproc 2>/dev/null \
+       || busybox grep -c '^processor' /proc/cpuinfo 2>/dev/null \
+       || echo 1)
+  [ "${nproc}" -le 0 ] 2>/dev/null && nproc=1
+
+  # per-core % = (进程增量 ticks / 总增量 ticks) × 核心数 × 100
+  # 与 ps %CPU / top %CPU 显示一致（使满单核 = 100%）
+  printf "%d" $(( dp * nproc * 100 / dt ))
+}
+
+# ── 2. CPU 占用过高检测 ────────────────────────────────────────────────────
+check_cpu() {
+  [ "${enable_cpu_watchdog}" = "true" ] || return 0
+
+  local pid
+  pid=$(busybox pidof "${bin_name}" 2>/dev/null | busybox awk '{print $1}')
+  if [ -z "${pid}" ]; then
+    _mlog Warning "CPU 监控: 核心 ${bin_name} 未运行，跳过检测"
+    return 0
+  fi
+
+  # 优先使用 /proc/stat 双采样（瞬时值，与 ps/top/软件显示一致）
+  local cpu
+  cpu=$(_get_proc_cpu "${pid}")
+
+  # 降级：/proc 读取失败时回退到 ps（仅作保底，值可能偏低）
+  if [ -z "${cpu}" ]; then
+    cpu=$(ps -p "${pid}" -o %cpu 2>/dev/null | busybox awk 'NR==2{printf "%d", $1+0}')
+    [ -n "${cpu}" ] && _mlog Warning "CPU 监控: /proc 采样失败，已降级使用 ps（值可能偏低）"
+  fi
+
+  if [ -z "${cpu}" ]; then
+    _mlog Warning "CPU 监控: 无法读取 ${bin_name}(PID: ${pid}) 的 CPU 占用"
+    return 0
+  fi
+
+  if [ "${cpu}" -ge "${cpu_watchdog_threshold}" ]; then
+    if [ ! -f "${CPU_HIGH_START_FILE}" ]; then
+      date +%s > "${CPU_HIGH_START_FILE}"
+      _mlog Warning "CPU 监控: ⚠ 占用 ${cpu}% ≥ 阈值 ${cpu_watchdog_threshold}% | ${bin_name}(PID: ${pid}) | 开始计时 (持续 ${cpu_watchdog_duration}s 后重启)"
+    else
+      local start_ts now elapsed remain_s
+      start_ts=$(cat "${CPU_HIGH_START_FILE}" 2>/dev/null)
+      now=$(date +%s)
+      elapsed=$((now - start_ts))
+      remain_s=$((cpu_watchdog_duration - elapsed))
+      _mlog Warning "CPU 监控: ⚠ 占用 ${cpu}% | ${bin_name}(PID: ${pid}) | 已持续 ${elapsed}s / ${cpu_watchdog_duration}s | 剩余 ${remain_s}s 触发重启"
+      if [ "${elapsed}" -ge "${cpu_watchdog_duration}" ]; then
+        _restart_core "CPU 占用 ${cpu}% 持续超过 ${cpu_watchdog_duration}s"
+      fi
+    fi
+  else
+    if [ -f "${CPU_HIGH_START_FILE}" ]; then
+      local start_ts now elapsed
+      start_ts=$(cat "${CPU_HIGH_START_FILE}" 2>/dev/null)
+      now=$(date +%s)
+      elapsed=$((now - start_ts))
+      _mlog_force Info "CPU 监控: ✓ 占用恢复正常 ${cpu}% | ${bin_name}(PID: ${pid}) | 高占用持续了 ${elapsed}s"
+      rm -f "${CPU_HIGH_START_FILE}"
+    # 正常时不重复记录，降低日志噪音
+    fi
+  fi
+}
+
+# ── 3. 定时重启（由 cron 以 scheduled 参数调用）────────────────────────────
+scheduled_restart() {
+  [ "${enable_scheduled_restart}" = "true" ] || {
+    _mlog Warning "定时重启: 已禁用 (enable_scheduled_restart=false)"
+    return 0
+  }
+  local sched_human
+  sched_human="$(_cron_to_human "${scheduled_restart_cron}")"
+  _mlog Info "定时重启: 按计划执行 (${sched_human})"
+  _restart_core "定时重启 (${sched_human})"
+}
+
+# ── 4. 后台 daemon 模式（由 box.service 启动，sleep loop）─────────────────
+run_daemon() {
+  # 记录自己的 PID
+  echo -n $$ > "${DAEMON_PID_FILE}"
+
+  local sched_human
+  sched_human="$(_cron_to_human "${scheduled_restart_cron}")"
+
+  _mlog_divider
+  _mlog_force Info "★ 监控 daemon 启动 (PID:$$, 间隔:${network_check_interval}s) | 网络:${enable_network_watchdog} CPU:${enable_cpu_watchdog} 定时重启:${enable_scheduled_restart}(${sched_human})"
+
+  # ── 等待核心完全启动且 iptables 就绪（runtime_save 写入 runtime.iptables.env
+  # 对应日志 "${bin_name} 已连接。"）后才开始第一次检测 ───────────────────────
+  local runtime_env="${box_run_state}/runtime.iptables.env"
+  local wait_i=0
+  local wait_max=120   # 最多等 120s
+  _mlog_force Info "  等待核心 ${bin_name} 启动及 iptables 就绪..."
+  while [ "${wait_i}" -lt "${wait_max}" ]; do
+    if busybox pidof "${bin_name}" >/dev/null 2>&1        && [ -f "${box_pid}" ]        && [ -f "${runtime_env}" ]; then
+      _mlog_force Info "  核心 ${bin_name} 已连接，iptables 就绪 (等待 ${wait_i}s)，开始监控"
+      break
+    fi
+    sleep 1
+    wait_i=$((wait_i + 1))
+  done
+  if [ "${wait_i}" -ge "${wait_max}" ]; then
+    _mlog_force Warning "  等待超时 (${wait_max}s)，iptables 可能未就绪，监控继续运行"
+  fi
+  _mlog_divider
+
+  while true; do
+    # 重新加载 settings.ini（支持热更新配置）
+    source /data/adb/box/settings.ini
+    enable_network_watchdog="${enable_network_watchdog:-true}"
+    network_watchdog_timeout="${network_watchdog_timeout:-5}"
+    network_test_host="${network_test_host:-https://cp.cloudflare.com}"
+    network_check_interval="${network_check_interval:-60}"
+    enable_cpu_watchdog="${enable_cpu_watchdog:-false}"
+    cpu_watchdog_threshold="${cpu_watchdog_threshold:-90}"
+    cpu_watchdog_duration="${cpu_watchdog_duration:-120}"
+    [ "${network_check_interval}" -lt 10 ] 2>/dev/null && network_check_interval=10
+
+    _trim_log
+    check_network
+    check_cpu
+
+    sleep "${network_check_interval}"
+  done
+}
+
+# ── 入口 ───────────────────────────────────────────────────────────────────
+mkdir -p "${MONITOR_STATE_DIR}" 2>/dev/null || true
+
+case "${1:-check}" in
+  daemon)
+    run_daemon
+    ;;
+  check)
+    _trim_log
+    _log_startup_summary
+    check_network
+    check_cpu
+    ;;
+  network)
+    check_network
+    ;;
+  cpu)
+    check_cpu
+    ;;
+  --scheduled|scheduled)
+    scheduled_restart
+    ;;
+  *)
+    echo "用法: $0 {daemon|check|network|cpu|scheduled}"
+    echo "  daemon     — 后台持续监控 (由 box.service 启动，间隔 network_check_interval 秒)"
+    echo "  check      — 单次检测网络与 CPU"
+    echo "  network    — 仅检测网络连通性"
+    echo "  cpu        — 仅检测 CPU 占用"
+    echo "  scheduled  — 执行定时重启 (由 cron 按 scheduled_restart_cron 调用)"
+    exit 1
+    ;;
+esac

@@ -560,6 +560,23 @@ probe_tun_device() {
   busybox ifconfig | grep -q "${tun_device}" || return 1
 }
 
+# 等待 TUN 设备就绪（核心启动后异步创建，需轮询）
+# 参数: $1=超时秒数(默认15)
+wait_tun_device() {
+  local timeout="${1:-15}"
+  local elapsed=0
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if probe_tun_device; then
+      log Info "TUN 设备 (${tun_device}) 已就绪 (等待 ${elapsed}s)"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  log Error "等待 TUN 设备 (${tun_device}) 超时 (${timeout}s)，设备未创建"
+  return 1
+}
+
 forward() {
   local action=$1
 
@@ -841,19 +858,19 @@ start_tproxy() {
   # NAT DNS 劫持链在后续（本地防回环规则之后）统一创建，避免重复插入
 
   # 跳过已被 TProxy 处理的流量，若默认路由接口有公网 IP，省略这些规则会导致本地流量代理异常，可能拖慢全网
-  # if [ "${cap_socket_match}" = "true" ]; then
-  #   if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-  #     ensure_rule_append mangle BOX_EXTERNAL -p tcp -m socket --transparent -j MARK --set-xmark ${fwmark}
-  #   fi
-  #   if [ "${proxy_udp}" = "true" ]; then
-  #     ensure_rule_append mangle BOX_EXTERNAL -p udp -m socket --transparent -j MARK --set-xmark ${fwmark}
-  #   fi
-  #   if [ "${proxy_tcp}" = "true" ] || [ "${proxy_udp}" = "true" ]; then
-  #     ensure_rule_append mangle BOX_EXTERNAL -m socket -j RETURN
-  #   fi
-  # else
-  #   [ "${iptables}" = "$IPV" ] && log Warning "未检测到 socket match，跳过部分优化规则（不影响基本功能）"
-  # fi
+  if [ "${cap_socket_match}" = "true" ]; then
+    if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+      ensure_rule_append mangle BOX_EXTERNAL -p tcp -m socket --transparent -j MARK --set-xmark ${fwmark}
+    fi
+    if [ "${proxy_udp}" = "true" ]; then
+      ensure_rule_append mangle BOX_EXTERNAL -p udp -m socket --transparent -j MARK --set-xmark ${fwmark}
+    fi
+    if [ "${proxy_tcp}" = "true" ] || [ "${proxy_udp}" = "true" ]; then
+      ensure_rule_append mangle BOX_EXTERNAL -m socket -j RETURN
+    fi
+  else
+    [ "${iptables}" = "$IPV" ] && log Warning "未检测到 socket match，跳过部分优化规则（不影响基本功能）"
+  fi
 
   # 跳过内网，兼容性可用 su -c 'zcat /proc/config.gz | grep -i addrtype' 检查
   # ${iptables} -t mangle -A BOX_EXTERNAL -m addrtype --dst-type LOCAL -j RETURN
@@ -1356,7 +1373,7 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
           log Info "正在创建 iptables 透明代理规则。"
 
           iptables="$IPV"
-          probe_tun_device || log Error "未找到 TUN 设备: (${tun_device})"
+          wait_tun_device
           forward -I || forward -D > /dev/null 2>&1
 
           if start_redirect; then
@@ -1454,7 +1471,7 @@ else
       }
       log_iptables_results
       cleanup_iptables
-      probe_tun_device || log Error "未找到 TUN 设备: (${tun_device})"
+      wait_tun_device
       [ $1 = "renew" ] && log Warning "正在清理 TUN 规则。"
       iptables="$IPV"
 

@@ -4,65 +4,34 @@ scripts_dir="${0%/*}"
 source /data/adb/box/settings.ini
 
 PROPFILE="/data/adb/modules/box_for_root/module.prop"
+RESTART_LOG="${box_run}/restart.log"      # 与内核日志同目录
 
 find_packages_uid() {
-  log Info "代理模式: ${proxy_mode}"
-
   if [ "${proxy_mode}" = "core" ]; then
-    log Info "核心模式已启用，跳过 package 和 gid 处理"
     > "${uid_list}"
     return 0
   fi
 
-  log Info "开始处理 UID/GID 列表"
-  log Debug "应用列表 (来自 package.list.cfg): ${packages_list[*]}"
-  log Debug "GID 列表 (来自 gid.list.cfg): ${gid_list[*]}"
-
   > "${uid_list}"
-
-  local packages_file
+  local packages_file ok=0 fail=0
   packages_file="${system_packages_file:-/data/system/packages.list}"
+
   for entry in "${packages_list[@]}"; do
-    local prefix="0"
-    local package="${entry}"
-
-    case "${entry}" in
-      *:*)
-        prefix="${entry%%:*}"
-        package="${entry#*:}"
-        ;;
-    esac
-
-    case "${prefix}" in
-      ''|*[!0-9]*)
-        log Warning "Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 用户前缀无效，已回退为 0"
-        prefix="0"
-        ;;
-    esac
-
+    local prefix="0" package="${entry}"
+    case "${entry}" in *:*) prefix="${entry%%:*}"; package="${entry#*:}" ;; esac
+    case "${prefix}" in ''|*[!0-9]*) prefix="0" ;; esac
     if [ -z "${package}" ] || [ "${package}" = "${entry}" ] && [ "${entry}" = "${prefix}" ]; then
-      log Warning "Failure: 用户 \"${prefix}\" 应用: \"${entry}\" -> 包名无效"
-      continue
+      fail=$((fail + 1)); continue
     fi
-
     local base_uid
     base_uid=$(busybox awk -v pkg="${package}" '$1 == pkg {print $2; exit}' "${packages_file}" 2>/dev/null)
-
-    case "${base_uid}" in
-      ''|*[!0-9]*)
-        log Warning "Failure: 用户 \"${prefix}\" 应用: \"${package}\" -> 未找到"
-        continue
-        ;;
-    esac
-
-    local multiuser_uid=$((base_uid + prefix * 100000))
-    echo "${multiuser_uid}" >> "${uid_list}"
-    log Info "Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
+    case "${base_uid}" in ''|*[!0-9]*) fail=$((fail + 1)); continue ;; esac
+    echo "$((base_uid + prefix * 100000))" >> "${uid_list}"
+    ok=$((ok + 1))
   done
 
   if [ ${#gid_list[@]} -gt 0 ]; then
     printf "%s\n" "${gid_list[@]}" >> "${uid_list}"
-    log Info "Success: GID: ${gid_list[*]} -> 已添加"
   fi
 
   if [ -s "${uid_list}" ]; then
@@ -70,6 +39,8 @@ find_packages_uid() {
     busybox sort -un "${uid_list}" > "${temp_uid_list}"
     mv "${temp_uid_list}" "${uid_list}"
   fi
+
+  [ $((ok + fail)) -gt 0 ] && log Debug "UID 处理: ${ok} 成功 / ${fail} 未找到 | 模式: ${proxy_mode}"
 }
 
 log_service_results() {
@@ -90,31 +61,43 @@ log_service_results() {
 }
 
 box_check_logs() {
-  # 删除所有内核日志并备份
-  log Info "删除并备份日志文件"
   (
-    for bin in "${bin_list[@]}"; do
-      if [ -f "${box_run}/${bin}.log" ]; then
-        mv "${box_run}/${bin}.log" "${box_run}/${bin}.old.log"
-      fi
-    done
-    # 删除其他日志文件
+    # 过期日志（超过1天）无论设置都清理，避免磁盘占用
+    find "${box_run}" -maxdepth 1 -type f \( -name "*.log" -o -name "*.old.log" \) -mtime +1 -exec rm -f {} +
+    # 临时状态文件始终清理
     find "${box_run}" -maxdepth 1 -type f \( -name "root" -o -name "*.inotify.log" \) -exec rm -f {} +
     find "${box_run_state}" -maxdepth 1 -type f \( -name "*.list" -a ! -name "appuid.list" \) -exec rm -f {} +
-    # 删除一天前的日志
-    find "${box_run}" -maxdepth 1 -type f \( -name "*.log" -o -name "*.old.log" \) -mtime +1 -exec rm -f {} +
+
+    # clear_restart_log 控制是否在每次启动时清空/备份内核日志
+    # 默认 true（与原行为一致），设为 false 则保留上次日志
+    if [ "${clear_restart_log:-true}" = "true" ]; then
+      for bin in "${bin_list[@]}"; do
+        if [ -f "${box_run}/${bin}.log" ]; then
+          mv "${box_run}/${bin}.log" "${box_run}/${bin}.old.log"
+        fi
+      done
+      # 仅在完整启动（非 restart-core）时备份 monitor.log，避免打断正在运行的监控守护
+      if [ "${SKIP_MONITOR_START:-false}" != "true" ] && [ -f "${box_run}/monitor.log" ]; then
+        mv "${box_run}/monitor.log" "${box_run}/monitor.old.log"
+      fi
+      log Debug "内核日志已备份 (clear_restart_log=true)"
+    else
+      log Debug "保留上次内核日志 (clear_restart_log=false)"
+    fi
   ) &
 }
 
 box_bin_alive() {
-  local PID=$(<"${box_pid}" 2>/dev/null)
-  if ! kill -0 "$PID" >/dev/null 2>&1; then
-    log Error "$(<"${box_run}/${bin_name}.log")"
-    log Error "${bin_name} 服务未运行。"
-    log Error "请检查 ${bin_name}.log 获取详细信息。"
-    log Error "清理无效 pid $PID"
+  local PID
+  PID=$(<"${box_pid}" 2>/dev/null)
+  if ! kill -0 "${PID}" >/dev/null 2>&1; then
+    # 只取日志末尾几行，避免把整个大文件写入 runs.log
+    log Error "${bin_name} (PID:${PID:-无}) 未运行，详情见: ${box_run}/${bin_name}.log"
+    tail -5 "${box_run}/${bin_name}.log" 2>/dev/null | while IFS= read -r line; do
+      log Error "  ${line}"
+    done
     for bin in "${bin_list[@]}"; do
-      killall -15 "${bin}" >/dev/null || busybox pkill -15 "${bin}" >/dev/null 2>&1 
+      killall -15 "${bin}" >/dev/null 2>&1 || busybox pkill -15 "${bin}" >/dev/null 2>&1
     done
     "${scripts_dir}/box.iptables" disable >/dev/null 2>&1
     [ -f "${box_pid}" ] && rm -f "${box_pid}"
@@ -129,17 +112,52 @@ box_run_crontab() {
   busybox crontab -c "${box_run_state}" -r
   echo "# root 的定时任务" > "${box_run_state}/root"
 
+  # 默认值（settings.ini 未配置时生效）
+  local _net_watch="${enable_network_watchdog:-true}"
+  local _cpu_watch="${enable_cpu_watchdog:-false}"
+  local _sched_restart="${enable_scheduled_restart:-false}"
+  local _sched_cron="${scheduled_restart_cron:-0 4 * * *}"
+
+  local need_crond=false
+
   if [ "${run_crontab}" = "true" ]; then
-    log Debug "crond 已启用"
+    need_crond=true
     if [ "$update_subscription" = "true" ] || [ "$update_geo" = "true" ]; then
-      log Debug "定时任务间隔: ${interva_update}."
       echo "${interva_update} ${scripts_dir}/box.tool geosub" >> "${box_run_state}/root"
-      log Info "${bin_name} geox 更新: ${update_geo}."
-      if [ "${bin_name}" = "mihomo" ]; then
-        log Info "${bin_name} 订阅更新: ${update_subscription}."
-      fi
+      log Debug "定时更新: geo=${update_geo} sub=${update_subscription} 间隔=${interva_update}"
     fi
     cat "${box_dir}/crontab.cfg" >> "${box_run_state}/root"
+    # 确保 crontab.cfg 末尾有换行，避免后续追加行粘连
+    echo "" >> "${box_run_state}/root"
+  fi
+
+  # ── 监控守护进程（后台 daemon，间隔由 network_check_interval 秒控制）────
+  local _net_watch="${enable_network_watchdog:-true}"
+  local _cpu_watch="${enable_cpu_watchdog:-false}"
+  local _sched_restart="${enable_scheduled_restart:-false}"
+  local _sched_cron="${scheduled_restart_cron:-0 4 * * *}"
+
+  if [ "${_net_watch}" = "true" ] || [ "${_cpu_watch}" = "true" ]; then
+    # 先杀掉旧的 monitor daemon
+    local old_mon_pid
+    old_mon_pid=$(cat "${box_run_state}/monitor.daemon.pid" 2>/dev/null)
+    if [ -n "${old_mon_pid}" ] && kill -0 "${old_mon_pid}" 2>/dev/null; then
+      kill -9 "${old_mon_pid}" >/dev/null 2>&1
+    fi
+    rm -f "${box_run_state}/monitor.daemon.pid"
+    nohup "${scripts_dir}/box.monitor" daemon >/dev/null 2>&1 &
+    echo -n $! > "${box_run_state}/monitor.daemon.pid"
+    log Debug "监控守护已启动 (网络:${_net_watch} CPU:${_cpu_watch} 间隔:${network_check_interval:-60}s)"
+  fi
+
+  # ── 定时重启核心（保留 cron）────────────────────────────────────────────
+  if [ "${_sched_restart}" = "true" ] && [ -n "${_sched_cron}" ]; then
+    need_crond=true
+    echo "${_sched_cron} ${scripts_dir}/box.monitor scheduled" >> "${box_run_state}/root"
+    log Info "定时重启已启用: [${_sched_cron}]"
+  fi
+
+  if [ "${need_crond}" = "true" ]; then
     chmod 0644 "${box_run_state}/root"
     nohup busybox crond -c "${box_run_state}" >/dev/null 2>&1 &
   else
@@ -251,6 +269,7 @@ prepare_singbox() {
           "auto_route": true,
           "strict_route": true,
           "auto_redirect": true,
+          "include_android_user": [0,10,999],
           "include_uid": [],
           "exclude_uid": []
         }]' -i --output-format=json "${sing_config}"
@@ -522,7 +541,7 @@ box_run_bin() {
       ;;
     xray)
       if [[ "${network_mode}" != "tproxy" ]]; then
-        sed -i 's/\(network_mode=\)"[^\"]*"/\1"tproxy"/g' ${settings}
+        sed -i 's/\(network_mode=\)"[^"]*"/\1"tproxy"/g' ${settings}
       fi
       if [ ! -f "${xray_config}" ]; then
         log Error "未找到配置文件：${xray_config}"
@@ -605,79 +624,46 @@ box_cgroup() {
 
 # 显示进程状态信息
 box_bin_status() {
-  # 获取进程 PID
-  local PID=$(busybox pidof ${bin_name})
-
-  if [ -z "$PID" ]; then
+  local PID
+  PID=$(busybox pidof "${bin_name}")
+  if [ -z "${PID}" ]; then
     log Error "${bin_name} 未在运行"
     return 1
   fi
 
-  stack=$(if [ "${bin_name}" != "mihomo" ]; then find "/data/adb/box/sing-box" -type f -name "*.json" -exec busybox awk -F'"' '/"stack"/{print $4}' {} +; else busybox awk '!/^ *#/ && /stack: / { print $2;found=1; exit}' "${mihomo_config}"; fi)
-  TOAST=1 log Info "${bin_name} 服务正在运行"
+  # 内存占用
+  local rss swap bin_rss bin_swap
+  rss=$(busybox awk '/VmRSS/{print $2}' /proc/${PID}/status 2>/dev/null || echo 0)
+  swap=$(busybox awk '/VmSwap/{print $2}' /proc/${PID}/status 2>/dev/null || echo 0)
+  [ "${rss:-0}" -ge 1024 ] && bin_rss="$(( rss / 1024 )) MB" || bin_rss="${rss:-0} KB"
+  [ "${swap:-0}" -ge 1024 ] && bin_swap="$(( swap / 1024 )) MB" || bin_swap="${swap:-0} KB"
 
-  log Info "代理模式: ${proxy_mode} + 网络模式: ${network_mode} + $(if [[ "${network_mode}" == @(mixed|tun) ]]; then echo "协议栈: ${stack}"; fi)"
-
-  # 获取内存使用情况
-  rss=$(grep VmRSS /proc/$PID/status | busybox awk '{ print $2 }')
-  [ "${rss}" -ge 1024 ] && bin_rss="$(expr ${rss} / 1024) MB" || bin_rss="${rss} KB"
-  swap=$(grep VmSwap /proc/$PID/status | busybox awk '{ print $2 }')
-  [ "${swap}" -ge 1024 ] && bin_swap="$(expr ${swap} / 1024) MB" || bin_swap="${swap} KB"
-
-  # 获取用户组信息
-  user_group=$(stat -c %U:%G /proc/$PID)
-
-  # 记录信息到日志
-  log Info "${bin_name} 以 '${user_group}' 用户组启动"
-  log Info "${bin_name} 状态: ${state} (PID: $PID)"
-  log Info "${bin_name} 内存占用: ${bin_rss}, 交换: ${bin_swap}"
-
-  # 获取 CPU 使用率
-  cpu=$(ps -p $PID -o %cpu | busybox awk 'NR==2{print $1}' 2>/dev/null)
-
-  cpus_allowed=$(grep Cpus_allowed_list /proc/$PID/status | busybox awk '{ print $2" "$3 }')
-  core=$(busybox awk '{print $39}' /proc/$PID/stat 2>/dev/null)
-
-  if [ -n "${cpu}" ]; then
-    log Info "${bin_name} CPU 使用率: ${cpu}%"
+  # 协议栈 / 运行时长 / 温度
+  local stack user_group running_time temperature_celsius
+  if [ "${bin_name}" != "mihomo" ]; then
+    stack=$(find "/data/adb/box/sing-box" -type f -name "*.json" -exec busybox awk -F'"' '/"stack"/{print $4}' {} + 2>/dev/null | head -1)
   else
-    log Info "${bin_name} CPU 使用率: 无法获取"
+    stack=$(busybox awk '!/^ *#/ && /stack: /{print $2; exit}' "${mihomo_config}" 2>/dev/null)
   fi
-  if [ -n "${cpus_allowed}" ]; then
-    log Info "${bin_name} 允许使用的 CPU 核心: ${cpus_allowed}"
-    log Info "${bin_name} 进程 $PID 最后运行在 CPU 核心: ${core}"
-  else
-    log Info "${bin_name} 运行的 CPU 核心: 无法获取"
-  fi
+  user_group=$(stat -c %U:%G /proc/${PID} 2>/dev/null)
+  running_time=$(busybox ps -o comm,etime 2>/dev/null | busybox grep "${bin_name}" | busybox awk '{print $2}' | head -1)
+  temperature_celsius=$(( $(cat /sys/class/power_supply/battery/temp 2>/dev/null || echo 0) / 10 ))
 
-  # 检查电池温度
-  temperature_celsius=$(($(cat /sys/class/power_supply/battery/temp) / 10))
-  log Info "电池温度: ${temperature_celsius}°C"
+  TOAST=1 log Info "${bin_name} 运行中 (PID:${PID}) | 用户:${user_group:-未知} | 时长:${running_time:-未知} | 电池:${temperature_celsius}°C"
+  local mode_info="代理:${proxy_mode} 网络:${network_mode}"
+  [[ "${network_mode}" == @(mixed|tun) ]] && mode_info="${mode_info} 栈:${stack:-未知}"
+  log Info "${mode_info} | 内存:${bin_rss} 交换:${bin_swap}"
 
-  # 获取运行时间
-  running_time=$(busybox ps -o comm,etime | grep ${bin_name} | busybox awk '{print $2}')
-  if [ -n "${running_time}" ]; then
-    log Info "${bin_name} 运行时间: ${running_time}"
-  else
-    log Info "${bin_name} 运行时间: 无法获取"
-  fi
-  
-  (
-    # 本地 IP
-    localIP=($(ip -4 a | awk '/inet / && !/127.0.0.1/ { split($2, a, "/"); print a[1] }'))
-    log Info "本地 IP: ${localIP[*]}"
-    # 本地 DNS
-    localDNS=($(dumpsys connectivity | awk -F'[ ,]' '/DnsAddresses:/ { for (i=1; i<=NF; i++) if ($i ~ /^\/.*$/) { dns=substr($i, 2); if (dns ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print dns } }'))
-    log Info "本地 DNS: ${localDNS[*]}"
+  ( # 异步获取网络信息，避免阻塞
+    local localIP localDNS
+    localIP=$(ip -4 a 2>/dev/null | busybox awk '/inet / && !/127.0.0.1/{split($2,a,"/"); printf "%s ",a[1]}')
+    localDNS=$(dumpsys connectivity 2>/dev/null | busybox awk -F'[ ,]' '/DnsAddresses:/{for(i=1;i<=NF;i++) if($i~/^\/[0-9]+\./) printf "%s ",substr($i,2)}')
+    log Debug "本地 IP:${localIP:-未知} | DNS:${localDNS:-未知}"
   ) &
 
-
-  # 保存进程 ID 到 pid 文件
-  if [ -n "$PID" ]; then
-    get_dns_mode
-    set_description running
-    echo -n "$PID" > "${box_pid}"
-  fi
+  get_dns_mode
+  set_description running
+  echo -n "${PID}" > "${box_pid}"
 }
 
 set_description() {
@@ -763,26 +749,84 @@ get_dns_mode() {
   export dns_mode
 }
 
+# ==================== 新增：仅重启核心（不影响监控守护和 crond） ====================
+_stop_core() {
+  # 停止核心进程（发送 SIGTERM）
+  for bin in "${bin_list[@]}"; do
+    busybox pkill -15 "${bin}" >/dev/null 2>&1
+  done
+
+  # 等待进程退出
+  local i=0
+  while busybox pidof "${bin_name}" >/dev/null 2>&1 && [ "$i" -lt 6 ]; do
+    sleep 1
+    i=$((i + 1))
+  done
+
+  # 若未退出则强制结束
+  if busybox pidof "${bin_name}" >/dev/null 2>&1; then
+    log Warning "核心 ${bin_name} 未正常退出，强制结束..."
+    for bin in "${bin_list[@]}"; do
+      busybox pkill -9 "${bin}" >/dev/null 2>&1
+    done
+  fi
+
+  # 清理 iptables 规则
+  "${scripts_dir}/box.iptables" disable >/dev/null 2>&1
+
+  rm -f "${box_pid}"
+  log Info "核心已停止"
+}
+
+_start_core() {
+  # 设置环境变量 SKIP_MONITOR_START=1 阻止 start_box 中启动监控守护和 crond
+  SKIP_MONITOR_START=1 start_box
+}
+
+restart_core_only() {
+  local reason="${1:-手动执行 restart-core}"
+  log Info "开始仅重启核心（不重启监控守护）..."
+  _stop_core
+  _start_core
+
+  # 等待核心进程出现并恢复 iptables（由 start_box 内的逻辑完成，但需额外等待 TUN 设备）
+  local pid_after=""
+  local i=0
+  while [ "$i" -lt 15 ]; do
+    pid_after=$(busybox pidof "${bin_name}" 2>/dev/null | busybox awk '{print $1}')
+    [ -n "$pid_after" ] && break
+    sleep 1
+    i=$((i + 1))
+  done
+
+  if [ -n "$pid_after" ]; then
+    log Info "核心重启完成，新 PID: $pid_after"
+    # 记录重启日志到独立文件
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [重启] 原因: ${reason} | 结果: 成功 (新PID: ${pid_after})" >> "${RESTART_LOG}"
+  else
+    log Error "核心重启失败，未检测到进程"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [重启] 原因: ${reason} | 结果: 失败 (未检测到进程)" >> "${RESTART_LOG}"
+  fi
+}
+# ========================================================================
+
 start_box() {
+  # 如果 SKIP_MONITOR_START 已设置，则跳过监控守护的启动
+  local skip_monitor="${SKIP_MONITOR_START:-false}"
   find_packages_uid
   get_dns_mode
   set_description running
 
   echo -n "" > "${box_log}"
-  box_version=$(busybox awk '!/^ *#/ && /version=/ { print $0 }' "/data/adb/modules/box_for_root/module.prop" 2>/dev/null)
-
+  # monitor.log 由 box.monitor 管理，重启时不清空，避免覆盖进行中的重启日志
+  local box_version
+  box_version=$(busybox awk '!/^ *#/ && /version=/{print $0}' "/data/adb/modules/box_for_root/module.prop" 2>/dev/null)
+  local start_banner="${box_version}($(getprop ro.product.cpu.abi)) | $(getprop gsm.sim.operator.alpha) $(getprop gsm.network.type) | $(date +%H:%M:%S)"
   if [ -t 1 ]; then
-    echo -e "${yellow}$(getprop persist.sys.timezone) $(date)${normal}"
-    echo -e "${yellow}$(getprop gsm.sim.operator.alpha) $(getprop gsm.network.type)${normal}"
-    echo -e "${yellow}${box_version}($(getprop ro.product.cpu.abi))${normal}"
+    echo -e "${yellow}${start_banner}${normal}"
     echo -e "${white}━━━━━━━━━━━━━━━━━━${normal}"
   else
-    {
-      echo "$(getprop persist.sys.timezone) $(date)"
-      echo "$(getprop gsm.sim.operator.alpha) $(getprop gsm.network.type)"
-      echo "${box_version}($(getprop ro.product.cpu.abi))"
-      echo "━━━━━━━━━━━━━━━━━━"
-    } | tee -a "${box_log}" >/dev/null 2>&1
+    echo "${start_banner}" | tee -a "${box_log}" >/dev/null 2>&1
   fi
 
   # 如果 bin_name 仍在运行则更新 iptables
@@ -796,14 +840,11 @@ start_box() {
   done
 
   if [ -n "$PID" ]; then
-    pid_name="${box_dir}/run/pid_name.txt"
-    ps -p $PID -o comm= > "${pid_name}"
-    sed -i '/^[[:space:]]*$/d' "${pid_name}"
-    log Debug "$(<"${pid_name}")(PID: $PID) 服务仍在运行，自动重启 BOX"
-    rm -f "${pid_name}"
+    local running_name
+    running_name=$(ps -p "${PID}" -o comm= 2>/dev/null | head -1)
+    log Debug "${running_name:-unknown}(PID:${PID}) 仍在运行，先停止再启动"
     stop_box
-    start_box && "${scripts_dir}/box.iptables" renew
-    exit 1
+    # 不递归调用 start_box；停止后让当前 start 流程继续
   fi
 
   # 检查 bin_name 是否已定义
@@ -820,24 +861,48 @@ start_box() {
   # busybox 检查
   busybox_code=$(busybox | busybox grep -oE '[0-9.]*' | head -n 1)
   if [ -n "${busybox_code}" ] && [ "$(echo "${busybox_code}" | busybox awk -F. '{printf "%03d%03d%03d\n", $1, $2, $3}')" -lt "$(echo "1.36.1" | busybox awk -F. '{printf "%03d%03d%03d\n", $1, $2, $3}')" ]; then
-    log Info "当前 $(which busybox) v${busybox_code}"
-    log Warning "请将 busybox 更新到 v1.36.1+"
+    log Warning "busybox v${busybox_code} 建议升级到 v1.36.1+"
   else
-    log Info "当前 $(which busybox) v${busybox_code}"
+    log Debug "busybox v${busybox_code}"
   fi
 
   box_permission
   box_check_bin
   box_check_logs
 
-  # 如果 run_crontab 不等于 "false" 则执行 box_run_crontab
-  [ "${run_crontab}" = "true" ] && box_run_crontab || log Info "定时任务已禁用"
+  # 如果 run_crontab 不等于 "false" 且未跳过监控守护，则执行 box_run_crontab
+  if [ "${run_crontab}" = "true" ] && [ "$skip_monitor" != "true" ]; then
+    box_run_crontab
+  else
+    log Info "定时任务和监控守护已跳过（内部重启）"
+  fi
 
   if [ -z "${proxy_mode}" ]; then
     M1=$(busybox awk '!/^ *#/ && /mode:/{print $0}' "${pkg_config}")
     [ -z $M1 ] && printf "\nmode:white" >> "${pkg_config}"
     log Debug "代理模式为空，在 ${pkg_config} 中添加 mode:white"
   fi
+
+  # === ColorOS Google Firewall Fixer ===
+  if [ "${clean_gfw_rules}" = "true" ]; then
+    _remove_reject_rules() {
+      local table=$1 chain=$2 proto=$3 cmd removed=0
+      case "$proto" in ipv4) cmd="iptables" ;; ipv6) cmd="ip6tables" ;; esac
+      command -v "$cmd" > /dev/null 2>&1 || return 0
+      echo "$cmd -t $table -nvL $chain --line-numbers 2>/dev/null | grep REJECT"       | sh | awk '{print $1}' | sort -nr | while read -r n; do
+          [ -n "$n" ] && [ "$n" -gt 0 ] && $cmd -t "$table" -D "$chain" "$n" 2>/dev/null
+        done
+    }
+    local _gfw_cleaned=0
+    for _chain in fw_INPUT fw_OUTPUT; do
+      _remove_reject_rules filter "$_chain" ipv4 && _gfw_cleaned=$((_gfw_cleaned+1))
+      _remove_reject_rules filter "$_chain" ipv6
+    done
+    log Debug "Google 防火墙规则清理完成"
+  else
+    log Debug "Google 防火墙规则清理已禁用（clean_gfw_rules=false）"
+  fi
+  # =====================================
 
   # 执行 box_cgroup, box_run_bin, box_detected_port, box_bin_alive 函数
   box_run_bin
@@ -855,34 +920,23 @@ start_box() {
 stop_box() {
   stop_cron
   for bin in "${bin_list[@]}"; do
-    if busybox pgrep "${bin}" >/dev/null; then
-      if busybox pkill -15 "${bin}" >/dev/null; then
-        :
-      else
-        killall -15 "${bin}" >/dev/null 2>&1 || kill -15 "$(busybox pidof "${bin}")" >/dev/null 2>&1
-      fi
-    fi
+    busybox pgrep "${bin}" >/dev/null || continue
+    busybox pkill -15 "${bin}" >/dev/null 2>&1 ||       killall -15 "${bin}" >/dev/null 2>&1 ||       kill -15 "$(busybox pidof "${bin}")" >/dev/null 2>&1
   done
 
-  count=0
-  while [ $count -lt 3 ]; do
-    if ! busybox pidof "${bin_name}" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 1
-    count=$((count + 1))
+  # 等待进程真正退出（最多 6s），避免重启时新旧实例并存
+  local i=0
+  while busybox pidof "${bin_name}" >/dev/null 2>&1 && [ $i -lt 6 ]; do
+    sleep 1; i=$((i + 1))
   done
 
-  if ! busybox pidof "${bin_name}" >/dev/null; then
-    if [ -f "${box_pid}" ]; then
-      rm -f "${box_pid}"
-    fi
-    log Warning "${bin_name} 已关闭，服务已停止。"
-    TOAST=1 log Warning "${bin_name} 已断开连接。"
-    [ -t 1 ] && echo -e "${white}━━━━━━━━━━━━━━━━━━${normal}"
-  else
-    log Warning "${bin_name} 未完全停止，可能正在关闭或关闭失败。"
+  if busybox pidof "${bin_name}" >/dev/null 2>&1; then
+    log Warning "${bin_name} ${i}s 内未退出，强制结束..."
     force_stop
+  else
+    [ -f "${box_pid}" ] && rm -f "${box_pid}"
+    TOAST=1 log Warning "${bin_name} 已停止"
+    [ -t 1 ] && echo -e "${white}━━━━━━━━━━━━━━━━━━${normal}"
   fi
 
   set_description stopped
@@ -895,6 +949,13 @@ stop_cron() {
       kill -15 "${cron}" >/dev/null 2>&1
     done
   fi
+  # 停止监控 daemon
+  local mon_pid
+  mon_pid=$(cat "${box_run_state}/monitor.daemon.pid" 2>/dev/null)
+  if [ -n "${mon_pid}" ] && kill -0 "${mon_pid}" 2>/dev/null; then
+    kill -9 "${mon_pid}" >/dev/null 2>&1
+  fi
+  rm -f "${box_run_state}/monitor.daemon.pid"
 }
 
 force_stop() {
@@ -939,6 +1000,17 @@ case "$1" in
       $scripts_dir/box.tool webroot >/dev/null 2>&1
     fi
     ;;
+  restart-core)
+    local reason=""
+    if [ -n "$2" ]; then
+      reason="$2"
+    elif [ -f "${box_run_state}/restart_reason" ]; then
+      reason=$(head -n1 "${box_run_state}/restart_reason" 2>/dev/null)
+      rm -f "${box_run_state}/restart_reason"
+    fi
+    [ -z "$reason" ] && reason="手动执行 restart-core"
+    restart_core_only "$reason"
+    ;;
   status)
     # 检查服务是否在运行
     if busybox pidof "${bin_name}" >/dev/null; then
@@ -961,6 +1033,6 @@ case "$1" in
     ;;
   *)
     echo "${red}$0 '$1' 未找到${normal}" >&2
-    echo "${yellow}用法${normal}: ${green}$0${normal} {${yellow}start|stop|restart|status|cron|kcron${normal}}" >&2
+    echo "${yellow}用法${normal}: ${green}$0${normal} {${yellow}start|stop|restart|restart-core|status|cron|kcron${normal}}" >&2
     ;;
 esac
