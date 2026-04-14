@@ -6,6 +6,206 @@ source /data/adb/box/settings.ini
 PROPFILE="/data/adb/modules/box_for_root/module.prop"
 RESTART_LOG="${box_run}/restart.log"      # 与内核日志同目录
 
+prepare_jsonc_for_yq() {
+  local input_file="$1"
+  local stripped_file="$2"
+  local comments_file="$3"
+
+  : > "${stripped_file}"
+  : > "${comments_file}"
+
+  busybox awk -v stripped="${stripped_file}" -v comments="${comments_file}" '
+    function add_comment(text) {
+      if (text == "") {
+        return
+      }
+      pending = pending text "\n"
+    }
+    function leading_ws(text,   matched) {
+      if (match(text, /^[[:space:]]*/)) {
+        matched = substr(text, RSTART, RLENGTH)
+        return matched
+      }
+      return ""
+    }
+    function flush_pending(out, trimmed, indent) {
+      if (pending == "") {
+        return
+      }
+
+      comment_id++
+      print "__BOX_COMMENT_BLOCK__" >> comments
+      print comment_id >> comments
+      printf "%s", pending >> comments
+      print "__BOX_COMMENT_END__" >> comments
+
+      indent = leading_ws(out)
+      trimmed = out
+      gsub(/^[[:space:]]+/, "", trimmed)
+
+      if (trimmed ~ /^"[^"]+"[[:space:]]*:/) {
+        print indent "\"__box_comment_" comment_id "__\": \"__BOX_PLACEHOLDER__\"," >> stripped
+      } else {
+        print indent "\"__box_comment_" comment_id "__\"," >> stripped
+      }
+
+      pending = ""
+    }
+    BEGIN {
+      pending = ""
+      block_comment = 0
+      block_text = ""
+      comment_id = 0
+    }
+    {
+      line = $0
+      out = ""
+      in_string = 0
+      escape = 0
+      i = 1
+
+      while (i <= length(line)) {
+        c = substr(line, i, 1)
+        n = (i < length(line) ? substr(line, i + 1, 1) : "")
+
+        if (block_comment) {
+          if (c == "*" && n == "/") {
+            block_text = block_text "*/"
+            add_comment(block_text)
+            block_text = ""
+            block_comment = 0
+            i += 2
+          } else {
+            block_text = block_text c
+            i++
+          }
+          continue
+        }
+
+        if (in_string) {
+          out = out c
+          if (escape) {
+            escape = 0
+          } else if (c == "\\") {
+            escape = 1
+          } else if (c == "\"") {
+            in_string = 0
+          }
+          i++
+          continue
+        }
+
+        if (c == "\"") {
+          in_string = 1
+          out = out c
+          i++
+          continue
+        }
+
+        if (c == "/" && n == "/") {
+          add_comment(substr(line, i))
+          break
+        }
+
+        if (c == "/" && n == "*") {
+          block_comment = 1
+          block_text = "/*"
+          i += 2
+          continue
+        }
+
+        out = out c
+        i++
+      }
+
+      if (out ~ /[^[:space:]]/) {
+        flush_pending(out)
+      }
+
+      print out >> stripped
+
+      if (block_comment) {
+        block_text = block_text "\n"
+      }
+    }
+    END {
+      if (block_text != "") {
+        add_comment(block_text)
+      }
+
+      if (pending != "") {
+        print "__BOX_COMMENT_BLOCK__" >> comments
+        print "EOF" >> comments
+        printf "%s", pending >> comments
+        print "__BOX_COMMENT_END__" >> comments
+      }
+    }
+  ' "${input_file}"
+}
+
+restore_json_comments_file() {
+  local input_file="$1"
+  local comments_file="$2"
+  local tmp_file="${box_run_state}/.$(basename "${input_file}").restore"
+
+  [ -s "${comments_file}" ] || return 0
+
+  busybox awk -v comments="${comments_file}" '
+    BEGIN {
+      eof_block = ""
+      while ((getline line < comments) > 0) {
+        if (line != "__BOX_COMMENT_BLOCK__") {
+          continue
+        }
+
+        if ((getline comment_id < comments) <= 0) {
+          break
+        }
+
+        block = ""
+        while ((getline body < comments) > 0 && body != "__BOX_COMMENT_END__") {
+          block = block body "\n"
+        }
+
+        if (comment_id == "EOF") {
+          eof_block = block
+        } else {
+          blocks[comment_id] = block
+        }
+      }
+      close(comments)
+    }
+    {
+      if (match($0, /^[[:space:]]*"__box_comment_([0-9]+)__"[[:space:]]*:[[:space:]]*"__BOX_PLACEHOLDER__"[[:space:]]*,?[[:space:]]*$/)) {
+        line = substr($0, RSTART, RLENGTH)
+        sub(/^[[:space:]]*"__box_comment_/, "", line)
+        sub(/__.*/, "", line)
+        if (line in blocks) {
+          printf "%s", blocks[line]
+          next
+        }
+      }
+
+      if (match($0, /^[[:space:]]*"__box_comment_([0-9]+)__"[[:space:]]*,?[[:space:]]*$/)) {
+        line = substr($0, RSTART, RLENGTH)
+        sub(/^[[:space:]]*"__box_comment_/, "", line)
+        sub(/__.*/, "", line)
+        if (line in blocks) {
+          printf "%s", blocks[line]
+          next
+        }
+      }
+
+      print $0
+    }
+    END {
+      if (eof_block != "") {
+        printf "%s", eof_block
+      }
+    }
+  ' "${input_file}" > "${tmp_file}" && mv "${tmp_file}" "${input_file}"
+}
+
 find_packages_uid() {
   if [ "${proxy_mode}" = "core" ]; then
     > "${uid_list}"
@@ -245,6 +445,22 @@ prepare_singbox() {
     yq="${box_dir}/bin/yq"
   fi
 
+  local stripped_sing_config="${box_run_state}/.$(basename "${sing_config}").json"
+  local sing_comments_file="${box_run_state}/.$(basename "${sing_config}").comments"
+
+  # 兼容带注释的 JSONC 配置：先提取注释，再生成无注释 JSON 供 yq 修改
+  if ! prepare_jsonc_for_yq "${sing_config}" "${stripped_sing_config}" "${sing_comments_file}"; then
+    log Error "预处理 ${sing_config} 失败，无法解析 JSON 注释"
+    set_description error "配置预处理失败"
+    exit 1
+  fi
+
+  if ! mv "${stripped_sing_config}" "${sing_config}"; then
+    log Error "写入 ${sing_config} 失败"
+    set_description error "配置预处理失败"
+    exit 1
+  fi
+
   # 设置 auto_detect_interface/auto_route
   ${yq} '.route.auto_detect_interface = true' -i --output-format=json "${sing_config}"
   ${yq} '(.inbounds[] | select(.type == "tun") | .auto_route) |= true' -i --output-format=json "${sing_config}"
@@ -252,94 +468,98 @@ prepare_singbox() {
   # 确保日志路径是绝对路径
   ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${sing_config}" 2>/dev/null || true
 
-  # 检查 sing-box 配置
-  if ( cd "$(dirname "${sing_config}")" && "${bin_path}" check -c "$(basename "${sing_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
-    # 根据 network_mode 设置 auto_route
-    if [[ "${network_mode}" == @(mixed|tun) ]]; then
-      # 检查配置中是否有 "type": "tun"
-      if ! busybox grep -q '"type": "tun"' "${sing_config}"; then
-        # 若无则添加 "tun" 配置
-        ${yq} '.inbounds += [{
-          "type": "tun",
-          "tag": "tun-in",
-          "interface_name": "sing",
-          "address": ["172.18.0.1/30","fdfe:dcba:9876::1/126"],
-          "mtu": 9000,
-          "stack": "mixed",
-          "auto_route": true,
-          "strict_route": true,
-          "auto_redirect": true,
-          "include_android_user": [0,10,999],
-          "include_uid": [],
-          "exclude_uid": []
-        }]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Tun] 配置"
-      fi
-    else
-      # 非 tun 模式，关闭 auto_route
-      # sed -i -e 's/auto_route": true/auto_route": false/g' -e 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${sing_config}"
-
-      # 检查是否有 tproxy 配置
-      if ! busybox grep -q '"type": "tproxy"' "${sing_config}"; then
-        # 若无则添加 tproxy 配置
-        ${yq} '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"'}]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Tproxy] 配置"
-      fi
-
-      # 删除 tun 配置
-      ${yq} 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${sing_config}"
-
-      # 同步 tproxy 端口
-      if busybox grep -q '"type": "tproxy"' "${sing_config}"; then
-        ${yq} '(.inbounds[] | select(.type == "tproxy") | .listen_port) = '"${tproxy_port}" -i --output-format=json "${sing_config}"
-      fi
-    fi
-
-    if [[ "${network_mode}" == @(mixed|tun) ]]; then
-      # core 模式：跳过 UID 处理
-      if [ "${proxy_mode}" = "core" ]; then
-        yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
-                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
-        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
-        log_service_results "sing-box" "core" ""
-      else
-        # 为 tun 添加 include_uid/exclude_uid 字段
-        yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
-                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
-        
-        [[ ${proxy_mode} = "blacklist" || ${proxy_mode} = "black" ]] && mode="exclude" || mode="include"
-        
-        local uids_to_add=""
-        if [ -s "${uid_list}" ]; then
-          uids_to_add=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
-          if [ -n "$uids_to_add" ]; then
-            yq_filter="$yq_filter | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
-          fi
-        fi
-        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
-        log_service_results "sing-box" "$mode" "$uids_to_add"
-      fi
-    fi
-
-    # 按 network_mode 添加 redirect 配置
-    if [[ "${network_mode}" == @(mixed|enhance|redirect) ]]; then
-      if ! busybox grep -q '"type": "redirect"' "${sing_config}"; then
-        # 若无则添加 redirect 配置
-        ${yq} '.inbounds += [{
-          "type": "redirect",
-          "tag": "redirect-in",
-          "listen": "::",
-          "listen_port": '"${redir_port}"'
-        }]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Redirect] 配置"
-      fi
-
-      # 同步 redir_port 端口
-      if busybox grep -q '"type": "redirect"' "${sing_config}"; then
-        ${yq} '(.inbounds[] | select(.type == "redirect") | .listen_port) = '"${redir_port}" -i --output-format=json "${sing_config}"
-      fi
+  # 根据 network_mode 设置 auto_route
+  if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    # 检查配置中是否有 "type": "tun"
+    if ! busybox grep -q '"type": "tun"' "${sing_config}"; then
+      # 若无则添加 "tun" 配置
+      ${yq} '.inbounds += [{
+        "type": "tun",
+        "tag": "tun-in",
+        "interface_name": "sing",
+        "address": ["172.18.0.1/30","fdfe:dcba:9876::1/126"],
+        "mtu": 9000,
+        "stack": "mixed",
+        "auto_route": true,
+        "strict_route": true,
+        "auto_redirect": true,
+        "include_android_user": [0,10,999],
+        "include_uid": [],
+        "exclude_uid": []
+      }]' -i --output-format=json "${sing_config}"
+      log Debug "已为 ${sing_config} 添加 [Tun] 配置"
     fi
   else
+    # 非 tun 模式，关闭 auto_route
+    # sed -i -e 's/auto_route": true/auto_route": false/g' -e 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${sing_config}"
+
+    # 检查是否有 tproxy 配置
+    if ! busybox grep -q '"type": "tproxy"' "${sing_config}"; then
+      # 若无则添加 tproxy 配置
+      ${yq} '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"'}]' -i --output-format=json "${sing_config}"
+      log Debug "已为 ${sing_config} 添加 [Tproxy] 配置"
+    fi
+
+    # 删除 tun 配置
+    ${yq} 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${sing_config}"
+
+    # 同步 tproxy 端口
+    if busybox grep -q '"type": "tproxy"' "${sing_config}"; then
+      ${yq} '(.inbounds[] | select(.type == "tproxy") | .listen_port) = '"${tproxy_port}" -i --output-format=json "${sing_config}"
+    fi
+  fi
+
+  if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    # core 模式：跳过 UID 处理
+    if [ "${proxy_mode}" = "core" ]; then
+      yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
+                 (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
+      "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
+      log_service_results "sing-box" "core" ""
+    else
+      # 为 tun 添加 include_uid/exclude_uid 字段
+      yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
+                 (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
+      
+      [[ ${proxy_mode} = "blacklist" || ${proxy_mode} = "black" ]] && mode="exclude" || mode="include"
+      
+      local uids_to_add=""
+      if [ -s "${uid_list}" ]; then
+        uids_to_add=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
+        if [ -n "$uids_to_add" ]; then
+          yq_filter="$yq_filter | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
+        fi
+      fi
+      "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
+      log_service_results "sing-box" "$mode" "$uids_to_add"
+    fi
+  fi
+
+  # 按 network_mode 添加 redirect 配置
+  if [[ "${network_mode}" == @(mixed|enhance|redirect) ]]; then
+    if ! busybox grep -q '"type": "redirect"' "${sing_config}"; then
+      # 若无则添加 redirect 配置
+      ${yq} '.inbounds += [{
+        "type": "redirect",
+        "tag": "redirect-in",
+        "listen": "::",
+        "listen_port": '"${redir_port}"'
+      }]' -i --output-format=json "${sing_config}"
+      log Debug "已为 ${sing_config} 添加 [Redirect] 配置"
+    fi
+
+    # 同步 redir_port 端口
+    if busybox grep -q '"type": "redirect"' "${sing_config}"; then
+      ${yq} '(.inbounds[] | select(.type == "redirect") | .listen_port) = '"${redir_port}" -i --output-format=json "${sing_config}"
+    fi
+  fi
+
+  if ! restore_json_comments_file "${sing_config}" "${sing_comments_file}"; then
+    log Warning "恢复 ${sing_config} 注释失败，已保留 yq 处理后的配置"
+  fi
+
+  # 在所有 yq 修改和注释恢复完成后再检查 sing-box 配置
+  if ! ( cd "$(dirname "${sing_config}")" && "${bin_path}" check -c "$(basename "${sing_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
     log Error "$(<"${box_run}/${bin_name}.log")"
     log Error "配置失败，请检查 ${box_run}/${bin_name}.log 文件。"
     set_description error
@@ -641,7 +861,7 @@ box_bin_status() {
   # 协议栈 / 运行时长 / 温度
   local stack user_group running_time temperature_celsius
   if [ "${bin_name}" != "mihomo" ]; then
-    stack=$(find "/data/adb/box/sing-box" -type f -name "*.json" -exec busybox awk -F'"' '/"stack"/{print $4}' {} + 2>/dev/null | head -1)
+    stack=$(busybox awk -F'"' '/"stack"/{print $4; exit}' "${sing_config}" 2>/dev/null)
   else
     stack=$(busybox awk '!/^ *#/ && /stack: /{print $2; exit}' "${mihomo_config}" 2>/dev/null)
   fi
