@@ -4,6 +4,7 @@
 
 项目深受以下仓库启发并在其基础上持续演进：
 - [CHIZI-0618/box4magisk](https://github.com/CHIZI-0618/box4magisk)
+- [CHIZI-0618/AndroidTProxyShell](https://github.com/CHIZI-0618/AndroidTProxyShell)
 - [taamarin/box_for_magisk](https://github.com/taamarin/box_for_magisk)
 
 ## 项目定位

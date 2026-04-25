@@ -696,9 +696,19 @@ upkernel() {
     return 1
   fi
 
+  local target_bin_name="${core_to_update}"
+  case "${core_to_update}" in
+    "mihomo_smart")
+      target_bin_name="mihomo"
+      ;;
+    "sing-box_ref1nd")
+      target_bin_name="sing-box"
+      ;;
+  esac
+
   mkdir -p "${bin_dir}/backup"
-  if [ -f "${bin_dir}/${core_to_update}" ]; then
-    cp "${bin_dir}/${core_to_update}" "${bin_dir}/backup/${core_to_update}.bak" >/dev/null 2>&1
+  if [ -f "${bin_dir}/${target_bin_name}" ]; then
+    cp "${bin_dir}/${target_bin_name}" "${bin_dir}/backup/${target_bin_name}.bak" >/dev/null 2>&1
   fi
   case $(uname -m) in
     "aarch64") 
@@ -740,6 +750,29 @@ upkernel() {
       
       log Debug "下载 ${download_link}"
       upfile "${box_dir}/${file_kernel}.gz" "${download_link}" && xkernel "$core_to_update" "" "" "" "$file_kernel"
+      ;;
+    "sing-box_ref1nd")
+      log Info "正在更新 sing-box reF1nd 核心"
+      local api_url="https://api.github.com/repos/reF1nd/sing-box-releases/releases"
+      local url_down="https://github.com/reF1nd/sing-box-releases/releases"
+
+      if [ "${singbox_stable}" = "disable" ]; then
+        log Debug "正在下载 ${core_to_update} 预发布版本"
+        latest_version=$($rev1 "${api_url}" | grep "tag_name" | busybox grep -oE "v[0-9].*" | head -1 | cut -d'"' -f1)
+      else
+        log Debug "正在下载 ${core_to_update} 最新稳定版本"
+        latest_version=$($rev1 "${api_url}/latest" | grep "tag_name" | busybox grep -oE "v[0-9].*" | head -1 | cut -d'"' -f1)
+      fi
+
+      if [ -z "$latest_version" ]; then
+        log Error "获取 sing-box reF1nd 最新版本失败"
+        return 1
+      fi
+
+      local file_kernel="${core_to_update}-${arch}"
+      local download_link="${url_down}/download/${latest_version}/sing-box-${latest_version#v}-${platform}-${arch}.tar.gz"
+      log Debug "下载 ${download_link}"
+      upfile "${box_dir}/${file_kernel}.tar.gz" "${download_link}" && xkernel "$core_to_update" "$platform" "$arch" "$latest_version" "$file_kernel"
       ;;
     "sing-box")
       api_url="https://api.github.com/repos/SagerNet/sing-box/releases"
@@ -863,6 +896,8 @@ xkernel() {
   local target_bin_name="$core_to_process"
   if [ "$core_to_process" = "mihomo_smart" ]; then
     target_bin_name="mihomo"
+  elif [ "$core_to_process" = "sing-box_ref1nd" ]; then
+    target_bin_name="sing-box"
   fi
   
   bin_name=$core_to_process
@@ -882,17 +917,17 @@ xkernel() {
         return 1
       fi
       ;;
-    "sing-box")
+    "sing-box"|"sing-box_ref1nd")
       tar_command="tar"
       if ! command -v tar >/dev/null; then
         tar_command="busybox tar"
       fi
       log Info "正在解压 Sing-Box 核心..."
       if ${tar_command} -xf "${box_dir}/${file_kernel}.tar.gz" -C "${bin_dir}" >/dev/null; then
-        mv "${bin_dir}/sing-box-${latest_version#v}-${platform}-${arch}/sing-box" "${bin_dir}/${core_to_process}"
+        mv "${bin_dir}/sing-box-${latest_version#v}-${platform}-${arch}/sing-box" "${bin_dir}/${target_bin_name}"
         if [ -f "${box_pid}" ]; then
           rm -rf /data/adb/box/sing-box/cache.db
-          restart_box "$core_to_process"
+          restart_box "$target_bin_name"
         else
           log Debug "${core_to_process} 无需重启."
         fi

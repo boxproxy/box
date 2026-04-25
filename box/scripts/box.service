@@ -57,15 +57,17 @@ find_packages_uid() {
 
     local multiuser_uid=$((base_uid + prefix * 100000))
     echo "${multiuser_uid}" >> "${uid_list}"
-    log Info "Success: 用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
+    log Debug "用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
   done
 
   if [ ${#gid_list[@]} -gt 0 ]; then
     printf "%s\n" "${gid_list[@]}" >> "${uid_list}"
-    log Info "Success: GID: ${gid_list[*]} -> 已添加"
+    log Debug "GID: ${gid_list[*]} -> 已添加"
   fi
 
   if [ -s "${uid_list}" ]; then
+    local uid_count=$(busybox wc -l < "${uid_list}")
+    log Info "UID/GID 列表处理完成: ${uid_count} 条"
     local temp_uid_list="${box_run_state}/temp_uid.list"
     busybox sort -un "${uid_list}" > "${temp_uid_list}"
     mv "${temp_uid_list}" "${uid_list}"
@@ -77,16 +79,8 @@ log_service_results() {
     local proxy_mode_type="$2"
     local uids="$3"
 
-    log Info "操作: 更新TUN模式UID列表"
-    log Info "模式: ${proxy_mode_type}"
-
-    if [ "${proxy_mode_type}" = "core" ]; then
-        log Debug "(核心模式, 所有应用透明代理)"
-    elif [ -n "$uids" ]; then
-        log Debug "应用的 UIDs: ${uids}"
-    else
-        log Debug "(无)"
-    fi
+    log Info "更新TUN模式UID列表: 模式=${proxy_mode_type}"
+    [ -n "$uids" ] && log Debug "UIDs: ${uids}"
 }
 
 box_check_logs() {
@@ -109,9 +103,7 @@ box_check_logs() {
 box_bin_alive() {
   local PID=$(<"${box_pid}" 2>/dev/null)
   if ! kill -0 "$PID" >/dev/null 2>&1; then
-    log Error "$(<"${box_run}/${bin_name}.log")"
-    log Error "${bin_name} 服务未运行。"
-    log Error "请检查 ${bin_name}.log 获取详细信息。"
+    log Error "${bin_name} 服务未运行。$(<"${box_run}/${bin_name}.log")"
     log Error "清理无效 pid $PID"
     for bin in "${bin_list[@]}"; do
       killall -15 "${bin}" >/dev/null || busybox pkill -15 "${bin}" >/dev/null 2>&1 
@@ -207,6 +199,412 @@ box_check_bin() {
   log Info "${version_output}"
 }
 
+tun_requires_manual_routing() {
+  [[ "${network_mode}" == @(mixed|tun) ]] && [ "${bypass_cn_ip}" = "true" ]
+}
+
+tun_should_force_gvisor() {
+  [[ "${network_mode}" == @(mixed|tun) ]] && [ "${bypass_cn_ip}" = "true" ]
+}
+
+tun_should_manage_core_config() {
+  [[ "${network_mode}" == @(mixed|tun) ]] && [ "${bypass_cn_ip}" = "true" ]
+}
+
+tun_auto_flag_value() {
+  if tun_requires_manual_routing; then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+}
+
+tun_effective_stack() {
+  if tun_should_force_gvisor; then
+    printf 'gvisor\n'
+  elif [ -n "${stack}" ]; then
+    printf '%s\n' "${stack}"
+  else
+    printf 'mixed\n'
+  fi
+}
+
+force_network_mode() {
+  local target_mode="$1"
+  local reason="$2"
+
+  [ -n "${target_mode}" ] || return 1
+  [ "${network_mode}" = "${target_mode}" ] && return 0
+
+  [ -n "${reason}" ] && log Warning "${reason}"
+  sed -i 's/\(network_mode=\)"[^"]*"/\1"'"${target_mode}"'"/g' "${settings}"
+  network_mode="${target_mode}"
+}
+
+sing_config_is_jsonc() {
+  local yq_bin="$1"
+  ! "${yq_bin}" eval '.' "${sing_config}" >/dev/null 2>&1
+}
+
+prepare_jsonc_for_yq() {
+  local input_file="$1"
+  local stripped_file="$2"
+  local comments_file="$3"
+
+  : > "${stripped_file}"
+  : > "${comments_file}"
+
+  busybox awk -v stripped="${stripped_file}" -v comments="${comments_file}" '
+    function add_comment(text) {
+      if (text == "") {
+        return
+      }
+      pending = pending text "\n"
+    }
+    function leading_ws(text, matched) {
+      if (match(text, /^[[:space:]]*/)) {
+        matched = substr(text, RSTART, RLENGTH)
+        return matched
+      }
+      return ""
+    }
+    function flush_pending(out, trimmed, indent) {
+      if (pending == "") {
+        return
+      }
+
+      comment_id++
+      print "__BOX_COMMENT_BLOCK__" >> comments
+      print comment_id >> comments
+      printf "%s", pending >> comments
+      print "__BOX_COMMENT_END__" >> comments
+
+      indent = leading_ws(out)
+      trimmed = out
+      gsub(/^[[:space:]]+/, "", trimmed)
+
+      if (trimmed ~ /^"[^"]+"[[:space:]]*:/) {
+        print indent "\"__box_comment_" comment_id "__\": \"__BOX_PLACEHOLDER__\"," >> stripped
+      } else {
+        print indent "\"__box_comment_" comment_id "__\"," >> stripped
+      }
+
+      pending = ""
+    }
+    BEGIN {
+      pending = ""
+      block_comment = 0
+      block_text = ""
+      comment_id = 0
+    }
+    {
+      line = $0
+      out = ""
+      in_string = 0
+      escape = 0
+      i = 1
+
+      while (i <= length(line)) {
+        c = substr(line, i, 1)
+        n = (i < length(line) ? substr(line, i + 1, 1) : "")
+
+        if (block_comment) {
+          if (c == "*" && n == "/") {
+            block_text = block_text "*/"
+            add_comment(block_text)
+            block_text = ""
+            block_comment = 0
+            i += 2
+          } else {
+            block_text = block_text c
+            i++
+          }
+          continue
+        }
+
+        if (in_string) {
+          out = out c
+          if (escape) {
+            escape = 0
+          } else if (c == "\\") {
+            escape = 1
+          } else if (c == "\"") {
+            in_string = 0
+          }
+          i++
+          continue
+        }
+
+        if (c == "\"") {
+          in_string = 1
+          out = out c
+          i++
+          continue
+        }
+
+        if (c == "/" && n == "/") {
+          add_comment(substr(line, i))
+          break
+        }
+
+        if (c == "/" && n == "*") {
+          block_comment = 1
+          block_text = "/*"
+          i += 2
+          continue
+        }
+
+        out = out c
+        i++
+      }
+
+      if (out ~ /[^[:space:]]/) {
+        flush_pending(out)
+      }
+
+      print out >> stripped
+
+      if (block_comment) {
+        block_text = block_text "\n"
+      }
+    }
+    END {
+      if (block_text != "") {
+        add_comment(block_text)
+      }
+
+      if (pending != "") {
+        print "__BOX_COMMENT_BLOCK__" >> comments
+        print "EOF" >> comments
+        printf "%s", pending >> comments
+        print "__BOX_COMMENT_END__" >> comments
+      }
+    }
+  ' "${input_file}"
+}
+
+restore_json_comments_file() {
+  local input_file="$1"
+  local comments_file="$2"
+  local tmp_file="${box_run_state}/.$(basename "${input_file}").restore"
+
+  [ -s "${comments_file}" ] || return 0
+
+  busybox awk -v comments="${comments_file}" '
+    BEGIN {
+      eof_block = ""
+      while ((getline line < comments) > 0) {
+        if (line != "__BOX_COMMENT_BLOCK__") {
+          continue
+        }
+
+        if ((getline comment_id < comments) <= 0) {
+          break
+        }
+
+        block = ""
+        while ((getline body < comments) > 0 && body != "__BOX_COMMENT_END__") {
+          block = block body "\n"
+        }
+
+        if (comment_id == "EOF") {
+          eof_block = block
+        } else {
+          blocks[comment_id] = block
+        }
+      }
+      close(comments)
+    }
+    {
+      if (match($0, /^[[:space:]]*"__box_comment_([0-9]+)__"[[:space:]]*:[[:space:]]*"__BOX_PLACEHOLDER__"[[:space:]]*,?[[:space:]]*$/)) {
+        line = substr($0, RSTART, RLENGTH)
+        sub(/^[[:space:]]*"__box_comment_/, "", line)
+        sub(/__.*/, "", line)
+        if (line in blocks) {
+          printf "%s", blocks[line]
+          next
+        }
+      }
+
+      if (match($0, /^[[:space:]]*"__box_comment_([0-9]+)__"[[:space:]]*,?[[:space:]]*$/)) {
+        line = substr($0, RSTART, RLENGTH)
+        sub(/^[[:space:]]*"__box_comment_/, "", line)
+        sub(/__.*/, "", line)
+        if (line in blocks) {
+          printf "%s", blocks[line]
+          next
+        }
+      }
+
+      print $0
+    }
+    END {
+      if (eof_block != "") {
+        printf "%s", eof_block
+      }
+    }
+  ' "${input_file}" > "${tmp_file}" && mv "${tmp_file}" "${input_file}"
+}
+
+sing_cleanup_work_config() {
+  [ -n "${stripped_sing_config}" ] && rm -f "${stripped_sing_config}"
+  [ -n "${sing_comments_file}" ] && rm -f "${sing_comments_file}"
+}
+
+sing_prepare_work_config() {
+  local yq_bin="$1"
+
+  sing_is_jsonc="false"
+  sing_work_config="${sing_config}"
+  stripped_sing_config=""
+  sing_comments_file=""
+
+  if sing_config_is_jsonc "${yq_bin}"; then
+    sing_is_jsonc="true"
+    stripped_sing_config="$(dirname "${sing_config}")/.$(basename "${sing_config}").work.json"
+    sing_comments_file="${box_run_state}/.$(basename "${sing_config}").comments"
+    sing_work_config="${stripped_sing_config}"
+
+    log Info "检测到 ${sing_config} 使用 JSONC 注释，提取纯 JSON 交给 yq 处理"
+    sing_cleanup_work_config
+    if ! prepare_jsonc_for_yq "${sing_config}" "${stripped_sing_config}" "${sing_comments_file}"; then
+      log Error "预处理 ${sing_config} 失败，无法提取 JSONC 注释"
+      set_description error "配置预处理失败"
+      exit 1
+    fi
+  fi
+}
+
+sing_set_route_auto_detect() {
+  local yq_bin="$1"
+  local enabled="$2"
+
+  if [ "${enabled}" = "true" ]; then
+    ${yq_bin} '.route.auto_detect_interface = true' -i --output-format=json "${sing_work_config}"
+  else
+    ${yq_bin} '.route.auto_detect_interface = false' -i --output-format=json "${sing_work_config}"
+  fi
+}
+
+sing_has_inbound() {
+  local inbound_type="$1"
+  busybox grep -q "\"type\": \"${inbound_type}\"" "${sing_work_config}"
+}
+
+sing_ensure_inbound() {
+  local yq_bin="$1"
+  local inbound_type="$2"
+  local inbound_payload="$3"
+  local inbound_label="$4"
+
+  if ! sing_has_inbound "${inbound_type}"; then
+    "${yq_bin}" ".inbounds += [${inbound_payload}]" -i --output-format=json "${sing_work_config}"
+    log Debug "已为 ${sing_config} 添加 [${inbound_label}] 配置"
+  fi
+}
+
+sing_delete_inbound() {
+  local yq_bin="$1"
+  local inbound_type="$2"
+
+  "${yq_bin}" "del(.inbounds[] | select(.type == \"${inbound_type}\"))" -i --output-format=json "${sing_work_config}"
+}
+
+sing_sync_inbound_port() {
+  local yq_bin="$1"
+  local inbound_type="$2"
+  local listen_port="$3"
+
+  if sing_has_inbound "${inbound_type}"; then
+    "${yq_bin}" "(.inbounds[] | select(.type == \"${inbound_type}\") | .listen_port) = ${listen_port}" -i --output-format=json "${sing_work_config}"
+  fi
+}
+
+sing_set_tun_flags() {
+  local yq_bin="$1"
+  local auto_route="$2"
+  local strict_route="$3"
+  local auto_redirect="$4"
+
+  if [ "${auto_route}" = "true" ]; then
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .auto_route) |= true' -i --output-format=json "${sing_work_config}"
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .strict_route) |= true' -i --output-format=json "${sing_work_config}"
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .auto_redirect) |= true' -i --output-format=json "${sing_work_config}"
+  else
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .auto_route) |= false' -i --output-format=json "${sing_work_config}"
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .strict_route) |= false' -i --output-format=json "${sing_work_config}"
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .auto_redirect) |= false' -i --output-format=json "${sing_work_config}"
+  fi
+}
+
+sing_set_tun_auto_route() {
+  local yq_bin="$1"
+  local auto_route="$2"
+
+  if [ "${auto_route}" = "true" ]; then
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .auto_route) |= true' -i --output-format=json "${sing_work_config}"
+  else
+    ${yq_bin} '(.inbounds[] | select(.type == "tun") | .auto_route) |= false' -i --output-format=json "${sing_work_config}"
+  fi
+}
+
+sing_set_tun_stack() {
+  local yq_bin="$1"
+  local tun_stack="$2"
+
+  ${yq_bin} "(.inbounds[] | select(.type == \"tun\") | .stack) = \"${tun_stack}\"" -i --output-format=json "${sing_work_config}"
+}
+
+sing_reset_tun_uid_filters() {
+  local yq_bin="$1"
+  local yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
+                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
+  "${yq_bin}" eval "${yq_filter}" -i --output-format=json "${sing_work_config}" > /dev/null 2>&1
+}
+
+sing_apply_tun_uid_filters() {
+  local yq_bin="$1"
+  local mode="$2"
+  local uids_to_add="$3"
+  local yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
+                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
+
+  if [ -n "${uids_to_add}" ]; then
+    yq_filter="${yq_filter} | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
+  fi
+
+  "${yq_bin}" eval "${yq_filter}" -i --output-format=json "${sing_work_config}" > /dev/null 2>&1
+}
+
+sing_validate_and_commit_work_config() {
+  if [ "${sing_is_jsonc}" = "true" ]; then
+    if ! restore_json_comments_file "${sing_work_config}" "${sing_comments_file}"; then
+      log Error "恢复 ${sing_config} 注释失败"
+      set_description error "配置注释恢复失败"
+      sing_cleanup_work_config
+      exit 1
+    fi
+  fi
+
+  if ! ( cd "$(dirname "${sing_work_config}")" && "${bin_path}" check -c "$(basename "${sing_work_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
+    log Error "$(<"${box_run}/${bin_name}.log")"
+    log Error "配置失败，请检查 ${box_run}/${bin_name}.log 文件。"
+    set_description error
+    sing_cleanup_work_config
+    exit 1
+  fi
+
+  if [ "${sing_is_jsonc}" = "true" ]; then
+    if ! mv -f "${sing_work_config}" "${sing_config}"; then
+      log Error "写回 ${sing_config} 失败"
+      set_description error "配置写回失败"
+      sing_cleanup_work_config
+      exit 1
+    fi
+    sing_cleanup_work_config
+  fi
+}
+
 prepare_singbox() {
   # 检查配置文件
   if ! [ -f "${sing_config}" ]; then
@@ -227,105 +625,97 @@ prepare_singbox() {
     yq="${box_dir}/bin/yq"
   fi
 
-  # 设置 auto_detect_interface/auto_route
-  ${yq} '.route.auto_detect_interface = true' -i --output-format=json "${sing_config}"
-  ${yq} '(.inbounds[] | select(.type == "tun") | .auto_route) |= true' -i --output-format=json "${sing_config}"
+  # 当 TUN + CNIP 由 box.iptables 接管策略路由时，这里只保留 TUN 入站，不再让内核自动写路由。
+  local tun_auto_route
+  local tun_strict_route
+  local tun_auto_redirect
+  local tun_auto_detect_interface
+  local tun_stack
+  tun_auto_route="$(tun_auto_flag_value)"
+  tun_strict_route="$(tun_auto_flag_value)"
+  tun_auto_redirect="$(tun_auto_flag_value)"
+  tun_auto_detect_interface="$(tun_auto_flag_value)"
+  tun_stack="$(tun_effective_stack)"
+  stack="${tun_stack}"
+  if tun_should_force_gvisor; then
+    log Info "检测到 TUN + 大陆IP分流，已将 sing-box 协议栈调整为 gvisor。"
+  fi
+
+  sing_prepare_work_config "${yq}"
+  if tun_should_manage_core_config; then
+    sing_set_route_auto_detect "${yq}" "${tun_auto_detect_interface}"
+    sing_set_tun_flags "${yq}" "${tun_auto_route}" "${tun_strict_route}" "${tun_auto_redirect}"
+  else
+    sing_set_route_auto_detect "${yq}" "true"
+    sing_set_tun_auto_route "${yq}" "true"
+  fi
   
   # 确保日志路径是绝对路径
-  ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${sing_config}" 2>/dev/null || true
+  ${yq} '.log.output = "'"${box_run}/${bin_name}.log"'"' -i --output-format=json "${sing_work_config}" 2>/dev/null || true
 
-  # 检查 sing-box 配置
-  if ( cd "$(dirname "${sing_config}")" && "${bin_path}" check -c "$(basename "${sing_config}")" ) > "${box_run}/${bin_name}.log" 2>&1; then
-    # 根据 network_mode 设置 auto_route
-    if [[ "${network_mode}" == @(mixed|tun) ]]; then
-      # 检查配置中是否有 "type": "tun"
-      if ! busybox grep -q '"type": "tun"' "${sing_config}"; then
-        # 若无则添加 "tun" 配置
-        ${yq} '.inbounds += [{
-          "type": "tun",
-          "tag": "tun-in",
-          "interface_name": "sing",
-          "address": ["172.18.0.1/30","fdfe:dcba:9876::1/126"],
-          "mtu": 9000,
-          "stack": "mixed",
-          "auto_route": true,
-          "strict_route": true,
-          "auto_redirect": true,
-          "include_uid": [],
-          "exclude_uid": []
-        }]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Tun] 配置"
-      fi
+  # 根据 network_mode 设置 auto_route
+  if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    local tun_inbound_payload
+    tun_inbound_payload=$(cat <<EOF
+{
+  "type": "tun",
+  "tag": "tun-in",
+  "interface_name": "sing",
+  "address": ["172.18.0.1/30","fdfe:dcba:9876::1/126"],
+  "mtu": 9000,
+  "stack": "${tun_stack}",
+  "auto_route": ${tun_auto_route},
+  "strict_route": ${tun_strict_route},
+  "auto_redirect": ${tun_auto_redirect},
+  "include_uid": [],
+  "exclude_uid": []
+}
+EOF
+)
+    sing_ensure_inbound "${yq}" "tun" "${tun_inbound_payload}" "Tun"
+
+    if tun_should_manage_core_config; then
+      sing_set_tun_flags "${yq}" "${tun_auto_route}" "${tun_strict_route}" "${tun_auto_redirect}"
+      sing_set_tun_stack "${yq}" "${tun_stack}"
     else
-      # 非 tun 模式，关闭 auto_route
-      # sed -i -e 's/auto_route": true/auto_route": false/g' -e 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${sing_config}"
-
-      # 检查是否有 tproxy 配置
-      if ! busybox grep -q '"type": "tproxy"' "${sing_config}"; then
-        # 若无则添加 tproxy 配置
-        ${yq} '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"'}]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Tproxy] 配置"
-      fi
-
-      # 删除 tun 配置
-      ${yq} 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${sing_config}"
-
-      # 同步 tproxy 端口
-      if busybox grep -q '"type": "tproxy"' "${sing_config}"; then
-        ${yq} '(.inbounds[] | select(.type == "tproxy") | .listen_port) = '"${tproxy_port}" -i --output-format=json "${sing_config}"
-      fi
-    fi
-
-    if [[ "${network_mode}" == @(mixed|tun) ]]; then
-      # core 模式：跳过 UID 处理
-      if [ "${proxy_mode}" = "core" ]; then
-        yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
-                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
-        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
-        log_service_results "sing-box" "core" ""
-      else
-        # 为 tun 添加 include_uid/exclude_uid 字段
-        yq_filter='(.inbounds[] | select(.type == "tun") | .include_uid) = [] |
-                   (.inbounds[] | select(.type == "tun") | .exclude_uid) = []'
-        
-        [[ ${proxy_mode} = "blacklist" || ${proxy_mode} = "black" ]] && mode="exclude" || mode="include"
-        
-        local uids_to_add=""
-        if [ -s "${uid_list}" ]; then
-          uids_to_add=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
-          if [ -n "$uids_to_add" ]; then
-            yq_filter="$yq_filter | (.inbounds[] | select(.type == \"tun\") | .${mode}_uid) = [${uids_to_add}]"
-          fi
-        fi
-        "${yq}" eval "$yq_filter" -i --output-format=json "${sing_config}" > /dev/null 2>&1
-        log_service_results "sing-box" "$mode" "$uids_to_add"
-      fi
-    fi
-
-    # 按 network_mode 添加 redirect 配置
-    if [[ "${network_mode}" == @(mixed|enhance|redirect) ]]; then
-      if ! busybox grep -q '"type": "redirect"' "${sing_config}"; then
-        # 若无则添加 redirect 配置
-        ${yq} '.inbounds += [{
-          "type": "redirect",
-          "tag": "redirect-in",
-          "listen": "::",
-          "listen_port": '"${redir_port}"'
-        }]' -i --output-format=json "${sing_config}"
-        log Debug "已为 ${sing_config} 添加 [Redirect] 配置"
-      fi
-
-      # 同步 redir_port 端口
-      if busybox grep -q '"type": "redirect"' "${sing_config}"; then
-        ${yq} '(.inbounds[] | select(.type == "redirect") | .listen_port) = '"${redir_port}" -i --output-format=json "${sing_config}"
-      fi
+      sing_set_tun_auto_route "${yq}" "true"
+      log Info "TUN 未启用大陆 IP 分流，保留 sing-box 现有 TUN 路由与协议栈配置。"
     fi
   else
-    log Error "$(<"${box_run}/${bin_name}.log")"
-    log Error "配置失败，请检查 ${box_run}/${bin_name}.log 文件。"
-    set_description error
-    exit 1
+    sing_ensure_inbound "${yq}" "tproxy" '{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"'}' "Tproxy"
+    sing_delete_inbound "${yq}" "tun"
+    sing_sync_inbound_port "${yq}" "tproxy" "${tproxy_port}"
   fi
+
+  if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    if [ "${proxy_mode}" = "core" ]; then
+      sing_reset_tun_uid_filters "${yq}"
+      log_service_results "sing-box" "core" ""
+    else
+      [[ ${proxy_mode} = "blacklist" || ${proxy_mode} = "black" ]] && mode="exclude" || mode="include"
+      
+      local uids_to_add=""
+      if [ -s "${uid_list}" ]; then
+        uids_to_add=$(busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//')
+      fi
+      sing_apply_tun_uid_filters "${yq}" "${mode}" "${uids_to_add}"
+      log_service_results "sing-box" "$mode" "$uids_to_add"
+    fi
+  fi
+
+  if [[ "${network_mode}" == @(mixed|enhance|redirect) ]]; then
+    sing_ensure_inbound "${yq}" "redirect" '{
+        "type": "redirect",
+        "tag": "redirect-in",
+        "listen": "::",
+        "listen_port": '"${redir_port}"'
+      }' "Redirect"
+    sing_sync_inbound_port "${yq}" "redirect" "${redir_port}"
+  else
+    sing_delete_inbound "${yq}" "redirect"
+  fi
+
+  sing_validate_and_commit_work_config
 }
 
 prepare_mihomo() {
@@ -363,6 +753,21 @@ prepare_mihomo() {
   fi
 
   if [[ "${network_mode}" == @(mixed|tun) ]]; then
+    # 当 TUN + CNIP 由 box.iptables 接管策略路由时，这里只同步 tun 开关，不再让 Mihomo 自动写路由。
+    local mihomo_tun_auto_route
+    local mihomo_tun_strict_route
+    local mihomo_tun_auto_redirect
+    local mihomo_tun_auto_detect_interface
+    local mihomo_tun_stack
+    mihomo_tun_auto_route="$(tun_auto_flag_value)"
+    mihomo_tun_strict_route="$(tun_auto_flag_value)"
+    mihomo_tun_auto_redirect="$(tun_auto_flag_value)"
+    mihomo_tun_auto_detect_interface="$(tun_auto_flag_value)"
+    mihomo_tun_stack="$(tun_effective_stack)"
+    stack="${mihomo_tun_stack}"
+    if tun_should_force_gvisor; then
+      log Info "检测到 TUN + 大陆IP分流，已将 mihomo 协议栈调整为 gvisor。"
+    fi
     mihomo_tun_status=$(busybox awk '!/^ *#/ && /tun:/ { getline; split($0, arr, ": "); print arr[2]; found=1; exit } END{ if (!found) print "" }' "${mihomo_config}" 2>/dev/null)
     # 写入 TUN 配置，如未配置
     if [ -z "${mihomo_tun_status}" ]; then
@@ -370,14 +775,14 @@ prepare_mihomo() {
         '  enable: true' \
         '  mtu: 9000' \
         '  device: meta' \
-        '  stack: mixed # / gvisor / system' \
+        "  stack: ${mihomo_tun_stack} # / gvisor / system" \
         '  dns-hijack:' \
         '    - any:53' \
         '    - tcp://any:53' \
-        '  auto-route: true' \
-        '  strict-route: true' \
-        '  auto-redirect: true' \
-        '  auto-detect-interface: true' \
+        "  auto-route: ${mihomo_tun_auto_route}" \
+        "  strict-route: ${mihomo_tun_strict_route}" \
+        "  auto-redirect: ${mihomo_tun_auto_redirect}" \
+        "  auto-detect-interface: ${mihomo_tun_auto_detect_interface}" \
         '  include-android-user: [0, 10]' \
         '  exclude-uid: []' \
         '  include-uid: []' \ >> "${mihomo_config}"
@@ -387,6 +792,13 @@ prepare_mihomo() {
     fi
 
     # core 模式：跳过 UID 处理
+    if tun_should_manage_core_config; then
+      sed -i -e "/^tun:/,/^[^ ]/ { s/^[[:space:]]*stack:.*/  stack: ${mihomo_tun_stack}/; s/^[[:space:]]*auto-route:.*/  auto-route: ${mihomo_tun_auto_route}/; s/^[[:space:]]*strict-route:.*/  strict-route: ${mihomo_tun_strict_route}/; s/^[[:space:]]*auto-redirect:.*/  auto-redirect: ${mihomo_tun_auto_redirect}/; s/^[[:space:]]*auto-detect-interface:.*/  auto-detect-interface: ${mihomo_tun_auto_detect_interface}/; }" "${mihomo_config}"
+    else
+      sed -i -e "/^tun:/,/^[^ ]/ { s/^[[:space:]]*auto-route:.*/  auto-route: true/; s/^[[:space:]]*auto-detect-interface:.*/  auto-detect-interface: true/; }" "${mihomo_config}"
+      log Info "TUN 未启用大陆 IP 分流，保留 Mihomo 现有 TUN 路由与协议栈配置。"
+    fi
+
     if [ "${proxy_mode}" = "core" ]; then
       sed -i -e "s/exclude-uid:.*/exclude-uid: []/g" \
           -e "s/include-uid:.*/include-uid: []/g" \
@@ -453,8 +865,7 @@ prepare_mihomo() {
 }
 
 box_run_bin() {
-  log Info "可用内核列表: [ ${bin_list[*]} ]"
-  log Info "选择内核: ${bin_name}，启动服务。"
+  log Info "启动服务: ${bin_name}"
   ulimit -SHn 1000000
 
   # 启动服务前刷新 box.tool 日志
@@ -472,11 +883,9 @@ box_run_bin() {
       # 验证 network_mode for hysteria
       case "${network_mode}" in
         redirect|tproxy|enhance)
-          # 支持的模式，无需操作
           ;;
         *)
-          # 不支持的模式，切换回 tproxy
-          sed -i 's/\(network_mode=\)"[^\"]*"/\1"tproxy"/g' ${settings}
+          force_network_mode "tproxy" "${bin_name} 不支持网络模式: ${network_mode}，已切换到 TPROXY"
           ;;
       esac
       nohup busybox setuidgid "${box_user_group}" "${bin_path}" -c "${hysteria_config}" > "${bin_log}" 2>&1 &
@@ -521,9 +930,7 @@ box_run_bin() {
       fi
       ;;
     xray)
-      if [[ "${network_mode}" != "tproxy" ]]; then
-        sed -i 's/\(network_mode=\)"[^\"]*"/\1"tproxy"/g' ${settings}
-      fi
+      force_network_mode "tproxy" "${bin_name} 仅支持 TPROXY，已自动切换网络模式"
       if [ ! -f "${xray_config}" ]; then
         log Error "未找到配置文件：${xray_config}"
         set_description error "配置文件不存在"
@@ -549,9 +956,7 @@ box_run_bin() {
       fi
       ;;
     v2fly)
-      if [[ "${network_mode}" != "tproxy" ]]; then
-        sed -i 's/\(network_mode=\)"[^"]*"/\1"tproxy"/g' ${settings}
-      fi
+      force_network_mode "tproxy" "${bin_name} 仅支持 TPROXY，已自动切换网络模式"
       if [ ! -f "${v2fly_config}" ]; then
         log Error "未找到配置文件：${v2fly_config}"
         set_description error "配置文件不存在"
@@ -628,9 +1033,7 @@ box_bin_status() {
   user_group=$(stat -c %U:%G /proc/$PID)
 
   # 记录信息到日志
-  log Info "${bin_name} 以 '${user_group}' 用户组启动"
-  log Info "${bin_name} 状态: ${state} (PID: $PID)"
-  log Info "${bin_name} 内存占用: ${bin_rss}, 交换: ${bin_swap}"
+  log Info "${bin_name} (PID: $PID) 用户组: ${user_group}, 内存: ${bin_rss}, 交换: ${bin_swap}"
 
   # 获取 CPU 使用率
   cpu=$(ps -p $PID -o %cpu | busybox awk 'NR==2{print $1}' 2>/dev/null)
@@ -638,17 +1041,7 @@ box_bin_status() {
   cpus_allowed=$(grep Cpus_allowed_list /proc/$PID/status | busybox awk '{ print $2" "$3 }')
   core=$(busybox awk '{print $39}' /proc/$PID/stat 2>/dev/null)
 
-  if [ -n "${cpu}" ]; then
-    log Info "${bin_name} CPU 使用率: ${cpu}%"
-  else
-    log Info "${bin_name} CPU 使用率: 无法获取"
-  fi
-  if [ -n "${cpus_allowed}" ]; then
-    log Info "${bin_name} 允许使用的 CPU 核心: ${cpus_allowed}"
-    log Info "${bin_name} 进程 $PID 最后运行在 CPU 核心: ${core}"
-  else
-    log Info "${bin_name} 运行的 CPU 核心: 无法获取"
-  fi
+  log Info "${bin_name} CPU: ${cpu:-无法获取}%, 允许核心: ${cpus_allowed:-无法获取}"
 
   # 检查电池温度
   temperature_celsius=$(($(cat /sys/class/power_supply/battery/temp) / 10))
@@ -656,11 +1049,7 @@ box_bin_status() {
 
   # 获取运行时间
   running_time=$(busybox ps -o comm,etime | grep ${bin_name} | busybox awk '{print $2}')
-  if [ -n "${running_time}" ]; then
-    log Info "${bin_name} 运行时间: ${running_time}"
-  else
-    log Info "${bin_name} 运行时间: 无法获取"
-  fi
+  log Info "${bin_name} 运行时间: ${running_time:-无法获取}"
   
   (
     # 本地 IP
@@ -820,8 +1209,7 @@ start_box() {
   # busybox 检查
   busybox_code=$(busybox | busybox grep -oE '[0-9.]*' | head -n 1)
   if [ -n "${busybox_code}" ] && [ "$(echo "${busybox_code}" | busybox awk -F. '{printf "%03d%03d%03d\n", $1, $2, $3}')" -lt "$(echo "1.36.1" | busybox awk -F. '{printf "%03d%03d%03d\n", $1, $2, $3}')" ]; then
-    log Info "当前 $(which busybox) v${busybox_code}"
-    log Warning "请将 busybox 更新到 v1.36.1+"
+    log Warning "当前 $(which busybox) v${busybox_code}，请更新到 v1.36.1+"
   else
     log Info "当前 $(which busybox) v${busybox_code}"
   fi

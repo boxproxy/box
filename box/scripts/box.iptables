@@ -4,26 +4,33 @@ scripts_dir="${0%/*}"
 source /data/adb/box/settings.ini
 
 runtime_iptables_env="${box_run_state}/runtime.iptables.env"
+cnip_force_proxy_uid_list="${box_run_state}/cnip_force_proxy.uid.list"
 
 fwmark="16777216/16777216"
 table="2024"
 pref="100"
-# 使用 iptables 规则禁用或启用 QUIC。注意，这可能导致部分网站无法访问。
+tun_bypass_mark="33554432/33554432"
+tun_bypass_pref="98"
+tun_route_mark="50331648/50331648"
+tun_route_table="2025"
+tun_route_pref="99"
+# 是否通过 iptables 规则拦截 QUIC。开启后，部分仅支持 QUIC 的站点可能无法访问。
 quic=${quic:-"enable"}
-mihomo_dns_forward=${mihomo_dns_forward:-"enable"}
+performance_mode=${performance_mode:-"false"}
 proxy_tcp=${proxy_tcp:-"true"}
 proxy_udp=${proxy_udp:-"true"}
 dns_hijack_tcp=${dns_hijack_tcp:-"true"}
 dns_hijack_udp=${dns_hijack_udp:-"true"}
 fake_ip_range=""
 fake_ip6_range=""
+stack="${stack:-gvisor}"
 
-# ex: 7.1.1
+# Android 版本号，例如 7.1.1
 buildVersion=$(getprop ro.build.version.release)
 minBuildVersion="11"
 IPV="iptables" # Default
 IP6V="ip6tables" # Default
-# ex: 7.1.1 -> 7
+# 主版本号，例如 7.1.1 -> 7
 buildVersionMajor=${buildVersion%%.*}
 if [ "$buildVersionMajor" -ge "$minBuildVersion" ]; then
   IPV="iptables -w 100"
@@ -81,8 +88,8 @@ ensure_rule_append() {
   local table_name="$1"
   local chain_name="$2"
   shift 2
-  # 对自定义链（每次启动都会 flush）跳过 -C 检查，加速启动。
-  # 注意：不要对内置链跳过检查，否则会导致规则重复累积。
+  # 自定义链每次启动都会先清空，直接追加即可，避免重复做 -C 检查。
+  # 内置链仍需保留检查，避免规则重复累积。
   if is_box_custom_chain "${chain_name}"; then
     ${iptables} -t "${table_name}" -A "${chain_name}" "$@" >/dev/null 2>&1 || true
     return 0
@@ -96,7 +103,7 @@ ensure_rule_insert() {
   local table_name="$1"
   local chain_name="$2"
   shift 2
-  # 对自定义链（每次启动都会 flush）跳过 -C 检查，加速启动。
+  # 自定义链每次启动都会先清空，直接插入即可，避免重复做 -C 检查。
   if is_box_custom_chain "${chain_name}"; then
     ${iptables} -t "${table_name}" -I "${chain_name}" "$@" >/dev/null 2>&1 || true
     return 0
@@ -109,7 +116,7 @@ ensure_rule_insert() {
 is_box_custom_chain() {
   local chain_name="$1"
   case "${chain_name}" in
-    BOX_*|DIVERT|LOCAL_IP_V4|LOCAL_IP_V6|NAT_DNS_HIJACK|NAT_DNS_HIJACK6|MIHOMO_DNS_EXTERNAL|MIHOMO_DNS_LOCAL|AP_* )
+    BOX_*|DIVERT|LOCAL_IP_V4|LOCAL_IP_V6|NAT_DNS_HIJACK|NAT_DNS_HIJACK6|NAT_DNS_FORWARD|NAT_DNS_FORWARD6|MIHOMO_DNS_EXTERNAL|MIHOMO_DNS_LOCAL|AP_* )
       return 0
       ;;
     *)
@@ -146,7 +153,7 @@ ip_rule_exists() {
   local fwmark="$2"
   local table_id="$3"
   local pref_id="$4"
-  ${ip_cmd} rule show pref "${pref_id}" 2>/dev/null | busybox grep -q "fwmark ${fwmark}.*lookup ${table_id}"
+  ${ip_cmd} rule show pref "${pref_id}" 2>/dev/null | busybox grep -Eq "fwmark ${fwmark}[[:space:]].*lookup ${table_id}([[:space:]]|\$)"
 }
 
 ensure_ip_rule() {
@@ -155,7 +162,7 @@ ensure_ip_rule() {
   local table_id="$3"
   local pref_id="$4"
   if ! ip_rule_exists "${ip_cmd}" "${fwmark}" "${table_id}" "${pref_id}"; then
-    ${ip_cmd} rule add fwmark "${fwmark}" table "${table_id}" pref "${pref_id}"
+    ${ip_cmd} rule add fwmark "${fwmark}" table "${table_id}" pref "${pref_id}" >/dev/null 2>&1 || true
   fi
 }
 
@@ -198,7 +205,7 @@ runtime_save() {
     printf 'bin_name="%s"\n' "${bin_name}"
     printf 'ipv6="%s"\n' "${ipv6}"
     printf 'dns_hijack_mode="%s"\n' "${dns_hijack_mode}"
-    printf 'mihomo_dns_forward="%s"\n' "${mihomo_dns_forward}"
+    printf 'performance_mode="%s"\n' "${performance_mode}"
     printf 'quic="%s"\n' "${quic}"
     printf 'proxy_tcp="%s"\n' "${proxy_tcp}"
     printf 'proxy_udp="%s"\n' "${proxy_udp}"
@@ -223,13 +230,13 @@ runtime_save() {
 runtime_load() {
   [ -f "${runtime_iptables_env}" ] || return 1
   . "${runtime_iptables_env}"
-  log Debug "已加载 runtime 快照: ${runtime_iptables_env}"
+  log Debug "已加载运行时快照: ${runtime_iptables_env}"
   return 0
 }
 
 runtime_clear() {
   rm -f "${runtime_iptables_env}" >/dev/null 2>&1 || true
-  log Debug "已清理 runtime 快照: ${runtime_iptables_env}"
+  log Debug "已清理运行时快照: ${runtime_iptables_env}"
 }
 
 cap_has_target() {
@@ -262,37 +269,51 @@ probe_capabilities() {
   cap_tproxy4="false"
   cap_tproxy6="false"
   cap_socket_match="false"
+  cap_socket_transparent="false"
+  cap_conntrack_match="false"
+  cap_connmark_match="false"
+  cap_connmark_target="false"
   cap_ipset="false"
   cap_ip6_nat="false"
 
   cap_has_target 4 TPROXY && cap_tproxy4="true"
   cap_has_target 6 TPROXY && cap_tproxy6="true"
 
-  # xt_socket
+  # socket match
   (cap_has_match 4 socket || cap_has_match 6 socket) && cap_socket_match="true"
+  if [ "${cap_socket_match}" = "true" ]; then
+    local _socket_probe_chain="BOX_SOCKET_PROBE"
+    ${IPV} -t mangle -N "${_socket_probe_chain}" >/dev/null 2>&1 || true
+    ${IPV} -t mangle -F "${_socket_probe_chain}" >/dev/null 2>&1 || true
+    if ${IPV} -t mangle -A "${_socket_probe_chain}" -p tcp -m socket --transparent -j RETURN >/dev/null 2>&1; then
+      cap_socket_transparent="true"
+    fi
+    ${IPV} -t mangle -F "${_socket_probe_chain}" >/dev/null 2>&1 || true
+    ${IPV} -t mangle -X "${_socket_probe_chain}" >/dev/null 2>&1 || true
+  fi
+  (cap_has_match 4 conntrack || cap_has_match 6 conntrack) && cap_conntrack_match="true"
+  (cap_has_match 4 connmark || cap_has_match 6 connmark) && cap_connmark_match="true"
+  (cap_has_target 4 CONNMARK || cap_has_target 6 CONNMARK) && cap_connmark_target="true"
 
   command -v ipset >/dev/null 2>&1 && cap_ipset="true"
   ip6_nat_supported && cap_ip6_nat="true"
 
-  log Debug "能力探测: TPROXY(v4=${cap_tproxy4}, v6=${cap_tproxy6}) socket_match=${cap_socket_match} ipset=${cap_ipset} ip6_nat=${cap_ip6_nat}"
+  log Debug "能力探测: TPROXY(v4=${cap_tproxy4}, v6=${cap_tproxy6}) socket_match=${cap_socket_match}/${cap_socket_transparent} conntrack=${cap_conntrack_match} connmark(match=${cap_connmark_match}, target=${cap_connmark_target}) ipset=${cap_ipset} ip6_nat=${cap_ip6_nat}"
 }
 
 log_context() {
-  log Info "运行上下文: mode=${network_mode}, bin=${bin_name}, ipv6=${ipv6}, dns_hijack=${dns_hijack_mode}"
-  log Info "运行上下文: ports(tproxy=${tproxy_port}, redir=${redir_port}, mihomo_dns=${mihomo_dns_port})"
-  log Info "运行上下文: flags(proxy_tcp=${proxy_tcp}, proxy_udp=${proxy_udp}, dns_tcp=${dns_hijack_tcp}, dns_udp=${dns_hijack_udp}, quic=${quic})"
-  log Info "运行上下文: cnip(total=${bypass_cn_ip}, v4=${bypass_cn_ip_v4}, v6=${bypass_cn_ip_v6})"
-  log Info "运行上下文: mac_filter(enable=${mac_filter}, mode=${mac_mode}, macs_count=${#macs_list[@]})"
+  log Info "运行上下文: 模式=${network_mode}, 内核=${bin_name}, IPv6=${ipv6}, DNS=${dns_hijack_mode}, 端口(tproxy=${tproxy_port}, redir=${redir_port}, dns=${mihomo_dns_port})"
+  log Info "开关: TCP=${proxy_tcp}, UDP=${proxy_udp}, DNS_TCP=${dns_hijack_tcp}, DNS_UDP=${dns_hijack_udp}, QUIC=${quic}, 性能=${performance_mode}, 大陆IP=${bypass_cn_ip}, MAC=${mac_filter}"
   if [ "${ap_list}" != "" ]; then
-    log Debug "接口 allow: ${ap_list[*]}"
+    log Debug "允许接口: ${ap_list[*]}"
   fi
   if [ "${ignore_ap_list}" != "" ]; then
-    log Debug "接口 ignore: ${ignore_ap_list[*]}"
+    log Debug "忽略接口: ${ignore_ap_list[*]}"
   fi
 }
 
 log_capabilities() {
-  log Info "能力: tproxy4=${cap_tproxy4}, tproxy6=${cap_tproxy6}, socket_match=${cap_socket_match}, ipset=${cap_ipset}, ip6_nat=${cap_ip6_nat}"
+  log Info "能力: tproxy4=${cap_tproxy4}, tproxy6=${cap_tproxy6}, socket_match=${cap_socket_match}/${cap_socket_transparent}, conntrack=${cap_conntrack_match}, connmark=${cap_connmark_match}/${cap_connmark_target}, ipset=${cap_ipset}, ip6_nat=${cap_ip6_nat}"
 }
 
 apply_capability_downgrades() {
@@ -303,25 +324,25 @@ apply_capability_downgrades() {
   local _old_cn="${bypass_cn_ip}"
 
   if [[ "${network_mode}" == @(tproxy|enhance) ]] && [ "${cap_tproxy4}" != "true" ]; then
-    log Warning "降级: 内核不支持 TPROXY, network_mode ${network_mode} -> redirect"
+    log Warning "降级: 内核不支持 TPROXY，网络模式 ${network_mode} -> redirect"
     network_mode="redirect"
   fi
 
   if [ "${dns_hijack_mode}" = "tproxy" ] && [ "${cap_tproxy4}" != "true" ]; then
-    log Warning "降级: 内核不支持 TPROXY, dns_hijack_mode tproxy -> redirect"
+    log Warning "降级: 内核不支持 TPROXY，DNS劫持模式 tproxy -> redirect"
     dns_hijack_mode="redirect"
   fi
 
   if [ "${bypass_cn_ip}" = "true" ] && [ "${cap_ipset}" != "true" ]; then
-    log Warning "降级: ipset 不可用, bypass_cn_ip true -> false"
+    log Warning "降级: ipset 不可用，大陆IP分流 true -> false"
     bypass_cn_ip="false"
     bypass_cn_ip_v4="false"
     bypass_cn_ip_v6="false"
   fi
 
-  [ "${_old_mode}" != "${network_mode}" ] && log Info "最终 network_mode=${network_mode}"
-  [ "${_old_dns}" != "${dns_hijack_mode}" ] && log Info "最终 dns_hijack_mode=${dns_hijack_mode}"
-  [ "${_old_cn}" != "${bypass_cn_ip}" ] && log Info "最终 bypass_cn_ip=${bypass_cn_ip}"
+  [ "${_old_mode}" != "${network_mode}" ] && log Info "最终 网络模式=${network_mode}"
+  [ "${_old_dns}" != "${dns_hijack_mode}" ] && log Info "最终 DNS劫持模式=${dns_hijack_mode}"
+  [ "${_old_cn}" != "${bypass_cn_ip}" ] && log Info "最终 大陆IP分流=${bypass_cn_ip}"
   log_capabilities
 }
 
@@ -343,6 +364,1363 @@ setup_nat_dns_hijack() {
   ensure_jump nat OUTPUT "${chain_name}"
 }
 
+dns_mode_is_redirect() {
+  [ "${dns_hijack_mode}" = "redirect" ]
+}
+
+dns_mode_is_disable() {
+  [ "${dns_hijack_mode}" = "disable" ]
+}
+
+dns_tcp_enabled() {
+  [ "${dns_hijack_tcp}" = "true" ]
+}
+
+dns_udp_enabled() {
+  [ "${dns_hijack_udp}" = "true" ]
+}
+
+uid_list_has_entries() {
+  [ -s "${uid_list}" ]
+}
+
+cnip_force_proxy_uid_list_has_entries() {
+  [ -s "${cnip_force_proxy_uid_list}" ]
+}
+
+trim_value() {
+  printf '%s' "$1" | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+prepare_cnip_force_proxy_uids() {
+  : > "${cnip_force_proxy_uid_list}"
+  [ "${bypass_cn_ip}" = "true" ] || return 0
+  [ ${#cnip_force_proxy_apps[@]} -gt 0 ] || return 0
+
+  local packages_file
+  packages_file="${system_packages_file:-/data/system/packages.list}"
+
+  for entry in "${cnip_force_proxy_apps[@]}"; do
+    entry="$(trim_value "${entry}")"
+    [ -n "${entry}" ] || continue
+
+    local prefix="0"
+    local package="${entry}"
+    local normalized_entry=""
+
+    case "${entry}" in
+      *:*)
+        prefix="${entry%%:*}"
+        package="${entry#*:}"
+        ;;
+    esac
+
+    prefix="$(trim_value "${prefix}")"
+    package="$(trim_value "${package}")"
+
+    case "${prefix}" in
+      ''|*[!0-9]*)
+        log Warning "CNIP 例外应用 \"${entry}\" 用户前缀无效，已回退为 0"
+        prefix="0"
+        ;;
+    esac
+
+    if [ -z "${package}" ]; then
+      log Warning "CNIP 例外应用 \"${entry}\" 包名无效，已跳过"
+      continue
+    fi
+
+    normalized_entry="${prefix}:${package}"
+    if [ "${entry}" = "${package}" ] && [ "${prefix}" = "0" ]; then
+      log Info "CNIP 例外应用 \"${entry}\" 未填写用户前缀，已按 \"${normalized_entry}\" 处理"
+    fi
+
+    local base_uid
+    base_uid=$(busybox awk -v pkg="${package}" '$1 == pkg {print $2; exit}' "${packages_file}" 2>/dev/null)
+
+    case "${base_uid}" in
+      ''|*[!0-9]*)
+        log Warning "CNIP 例外应用 \"${normalized_entry}\" 未找到 UID，已跳过"
+        continue
+        ;;
+    esac
+
+    echo $((base_uid + prefix * 100000)) >> "${cnip_force_proxy_uid_list}"
+  done
+
+  if [ -s "${cnip_force_proxy_uid_list}" ]; then
+    local temp_uid_list="${box_run_state}/cnip_force_proxy.temp.list"
+    busybox sort -un "${cnip_force_proxy_uid_list}" > "${temp_uid_list}"
+    mv "${temp_uid_list}" "${cnip_force_proxy_uid_list}"
+    log Info "CNIP 例外应用 UID 已加载: $(busybox tr '\n' ' ' < "${cnip_force_proxy_uid_list}" | sed 's/[[:space:]]*$//')"
+  fi
+}
+
+dns_target_port() {
+  local port="${mihomo_dns_port}"
+  [ -n "${port}" ] || port="1053"
+  printf '%s\n' "${port}"
+}
+
+dns_should_use_mihomo_forward() {
+  [ "${mihomo_dns_forward}" = "enable" ] || return 1
+  [ "${bin_name}" = "mihomo" ] || return 1
+  dns_mode_is_redirect && return 1
+  dns_mode_is_disable && return 1
+  return 0
+}
+
+setup_nat_dns_forward() {
+  local chain_name="$1"
+  local dns_port="$2"
+  local family="$3"
+
+  ensure_chain nat "${chain_name}"
+  ensure_rule_insert nat "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  if [ "${family}" = "4" ] && [ "${ignore_ap_list}" != "" ]; then
+    for ignore in ${ignore_ap_list[@]} ; do
+      ensure_rule_append nat "${chain_name}" -i "${ignore}" -j RETURN
+    done
+  fi
+  if dns_udp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  fi
+  ensure_jump nat PREROUTING "${chain_name}"
+  ensure_jump nat OUTPUT "${chain_name}"
+}
+
+ensure_dns_nat_hijack() {
+  dns_mode_is_redirect || dns_should_use_mihomo_forward || return 0
+  if [ "${iptables}" = "$IP6V" ] && ! ip6_nat_supported; then
+    [ "${ipv6}" = "true" ] && log Warning "ip6tables NAT 不可用，跳过 IPv6 DNS 重定向。"
+    return 0
+  fi
+
+  local chain_name="NAT_DNS_HIJACK"
+  local family="4"
+  if [ "${iptables}" = "$IP6V" ]; then
+    chain_name="NAT_DNS_HIJACK6"
+    family="6"
+  fi
+
+  if dns_mode_is_redirect; then
+    setup_nat_dns_hijack "${chain_name}" "$(dns_target_port)" "${family}"
+  else
+    if [ "${iptables}" = "$IPV" ]; then
+      chain_name="NAT_DNS_FORWARD"
+    else
+      chain_name="NAT_DNS_FORWARD6"
+    fi
+    setup_nat_dns_forward "${chain_name}" "$(dns_target_port)" "${family}"
+  fi
+}
+
+append_dns_return_rules() {
+  local chain_name="$1"
+  if [ "${network_mode}" != "enhance" ] && dns_tcp_enabled; then
+    ensure_rule_append mangle "${chain_name}" -p tcp --dport 53 -j RETURN
+  fi
+  if dns_udp_enabled; then
+    ensure_rule_append mangle "${chain_name}" -p udp --dport 53 -j RETURN
+  fi
+}
+
+append_dns_tproxy_rules() {
+  local chain_name="$1"
+  if [ "${network_mode}" != "enhance" ] && dns_tcp_enabled && [ "${proxy_tcp}" = "true" ]; then
+    append_tproxy_dispatch_rule "${chain_name}" -p tcp --dport 53
+  fi
+  if dns_udp_enabled && [ "${proxy_udp}" = "true" ]; then
+    append_tproxy_dispatch_rule "${chain_name}" -p udp --dport 53
+  fi
+}
+
+append_dns_mark_rules() {
+  local chain_name="$1"
+  if [ "${network_mode}" != "enhance" ] && dns_tcp_enabled && [ "${proxy_tcp}" = "true" ]; then
+    ensure_rule_append mangle "${chain_name}" -p tcp --dport 53 -j MARK --set-xmark "${fwmark}"
+  fi
+  if dns_udp_enabled && [ "${proxy_udp}" = "true" ]; then
+    ensure_rule_append mangle "${chain_name}" -p udp --dport 53 -j MARK --set-xmark "${fwmark}"
+  fi
+}
+
+append_redirect_dispatch_rule() {
+  local chain_name="$1"
+  shift
+
+  if performance_connmark_enabled; then
+    ensure_rule_append nat "${chain_name}" "$@" -m conntrack --ctstate NEW,RELATED -j CONNMARK --set-xmark "${fwmark}"
+    ensure_rule_append nat "${chain_name}" "$@" -m conntrack --ctstate NEW,RELATED -m connmark --mark "${fwmark}" -j REDIRECT --to-ports "${redir_port}"
+    return 0
+  fi
+
+  ensure_rule_append nat "${chain_name}" "$@" -j REDIRECT --to-ports "${redir_port}"
+}
+
+apply_redirect_connmark_restore_rules() {
+  local chain_name="$1"
+
+  performance_connmark_enabled || return 0
+  [ "${proxy_tcp}" = "true" ] || return 0
+  ensure_rule_append nat "${chain_name}" -p tcp -m connmark --mark "${fwmark}" -j REDIRECT --to-ports "${redir_port}"
+}
+
+apply_redirect_performance_rules() {
+  [ "${performance_mode}" = "true" ] || return 0
+  [ "${iptables}" = "$IPV" ] || return 0
+
+  if redirect_performance_chain_enabled; then
+    case "${network_mode}" in
+      enhance)
+        log Info "性能模式：Enhance 下已启用 REDIRECT 子链快速路径。"
+        ;;
+      mixed)
+        log Info "性能模式：Enhance 下已启用 REDIRECT 子链快速路径。"
+        ;;
+      *)
+        log Info "性能模式：已启用 REDIRECT 子链快速路径。"
+        ;;
+    esac
+  else
+    log Warning "性能模式已开启，但 REDIRECT 模式未检测到可用的 conntrack / connmark 支持，跳过额外优化。"
+  fi
+}
+
+apply_mangle_dns_rules() {
+  local chain_name="$1"
+  local rule_mode="$2"
+
+  if dns_mode_is_redirect || dns_mode_is_disable || dns_should_use_mihomo_forward; then
+    append_dns_return_rules "${chain_name}"
+    return 0
+  fi
+
+  case "${rule_mode}" in
+    tproxy)
+      append_dns_tproxy_rules "${chain_name}"
+      ;;
+    mark)
+      append_dns_mark_rules "${chain_name}"
+      ;;
+  esac
+}
+
+ensure_local_ip_chain() {
+  local table_name="$1"
+  if [ "${iptables}" = "$IPV" ]; then
+    ensure_chain "${table_name}" LOCAL_IP_V4
+  else
+    ensure_chain "${table_name}" LOCAL_IP_V6
+  fi
+}
+
+append_common_bypass_rules() {
+  local table_name="$1"
+  local chain_name="$2"
+
+  ensure_local_ip_chain "${table_name}"
+
+  if [ "${iptables}" = "$IPV" ]; then
+    for subnet in ${intranet[@]} ; do
+      ensure_rule_append "${table_name}" "${chain_name}" -d ${subnet} -j RETURN
+    done
+    if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ] && command -v ipset >/dev/null 2>&1; then
+      ensure_rule_append "${table_name}" "${chain_name}" -m set --match-set cnip dst -j RETURN
+    fi
+    ensure_rule_append "${table_name}" "${chain_name}" -j LOCAL_IP_V4
+  else
+    for subnet6 in ${intranet6[@]} ; do
+      ensure_rule_append "${table_name}" "${chain_name}" -d ${subnet6} -j RETURN
+    done
+    if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v6}" = "true" ] && command -v ipset >/dev/null 2>&1; then
+      ensure_rule_append "${table_name}" "${chain_name}" -m set --match-set cnip6 dst -j RETURN
+    fi
+    ensure_rule_append "${table_name}" "${chain_name}" -j LOCAL_IP_V6
+  fi
+}
+
+append_cnip_force_proxy_local_rules() {
+  local table_name="$1"
+  local chain_name="$2"
+  local action="$3"
+  local set_name=""
+
+  [ "${bypass_cn_ip}" = "true" ] || return 0
+  cnip_force_proxy_uid_list_has_entries || return 0
+  command -v ipset >/dev/null 2>&1 || return 0
+
+  if [ "${iptables}" = "$IPV" ]; then
+    [ "${bypass_cn_ip_v4}" = "true" ] || return 0
+    set_name="cnip"
+  else
+    [ "${bypass_cn_ip_v6}" = "true" ] || return 0
+    set_name="cnip6"
+  fi
+
+  while read -r appid; do
+    [ -n "${appid}" ] || continue
+    case "${action}" in
+      redirect)
+        [ "${proxy_tcp}" = "true" ] || continue
+        append_redirect_dispatch_rule "${chain_name}" -p tcp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst
+        ;;
+      mark)
+        if [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+          ensure_rule_append "${table_name}" "${chain_name}" -p tcp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j MARK --set-xmark "${fwmark}"
+          ensure_rule_append "${table_name}" "${chain_name}" -p tcp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j RETURN
+        fi
+        if [ "${proxy_udp}" = "true" ]; then
+          ensure_rule_append "${table_name}" "${chain_name}" -p udp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j MARK --set-xmark "${fwmark}"
+          ensure_rule_append "${table_name}" "${chain_name}" -p udp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j RETURN
+        fi
+        ;;
+    esac
+  done < "${cnip_force_proxy_uid_list}"
+}
+
+append_cnip_force_proxy_tun_rules() {
+  local chain_name="$1"
+  local set_name=""
+
+  [ "${bypass_cn_ip}" = "true" ] || return 0
+  cnip_force_proxy_uid_list_has_entries || return 0
+  command -v ipset >/dev/null 2>&1 || return 0
+
+  if [ "${iptables}" = "$IPV" ]; then
+    [ "${bypass_cn_ip_v4}" = "true" ] || return 0
+    set_name="cnip"
+  else
+    [ "${bypass_cn_ip_v6}" = "true" ] || return 0
+    set_name="cnip6"
+  fi
+
+  while read -r appid; do
+    [ -n "${appid}" ] || continue
+    if [ "${proxy_tcp}" = "true" ]; then
+      ensure_rule_append mangle "${chain_name}" -p tcp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j MARK --set-xmark "${tun_route_mark}"
+      ensure_rule_append mangle "${chain_name}" -p tcp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j RETURN
+    fi
+    if [ "${proxy_udp}" = "true" ]; then
+      ensure_rule_append mangle "${chain_name}" -p udp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j MARK --set-xmark "${tun_route_mark}"
+      ensure_rule_append mangle "${chain_name}" -p udp -m owner --uid-owner "${appid}" -m set --match-set "${set_name}" dst -j RETURN
+    fi
+  done < "${cnip_force_proxy_uid_list}"
+}
+
+append_local_protocol_rule() {
+  local table_name="$1"
+  local chain_name="$2"
+  local proto="$3"
+  local action="$4"
+  local owner_kind="$5"
+  local owner_value="$6"
+
+  if [ "${proto}" = "tcp" ]; then
+    [ "${proxy_tcp}" = "true" ] || return 0
+  else
+    [ "${proxy_udp}" = "true" ] || return 0
+  fi
+
+  set -- -p "${proto}"
+  if [ -n "${owner_kind}" ] && [ -n "${owner_value}" ]; then
+    set -- "$@" -m owner "--${owner_kind}" "${owner_value}"
+  fi
+
+  case "${action}" in
+    redirect)
+      [ "${proto}" = "tcp" ] || return 0
+      append_redirect_dispatch_rule "${chain_name}" "$@"
+      ;;
+    mark)
+      if [ "${proto}" = "tcp" ] && [ "${network_mode}" = "enhance" ]; then
+        return 0
+      fi
+      ensure_rule_append "${table_name}" "${chain_name}" "$@" -j MARK --set-xmark "${fwmark}"
+      ;;
+  esac
+}
+
+apply_local_proxy_rules() {
+  local table_name="$1"
+  local chain_name="$2"
+  local action="$3"
+
+  case "${proxy_mode}" in
+    core)
+      append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}"
+      append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}"
+      [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ] && log Info "核心模式：所有应用透明代理。"
+      ;;
+    blacklist|black)
+      if uid_list_has_entries; then
+        while read -r appid; do
+          ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner "${appid}" -j RETURN
+        done < "${uid_list}"
+      fi
+      if [ "${gid_list}" != "" ] ; then
+        for gid in ${gid_list[@]} ; do
+          ensure_rule_append "${table_name}" "${chain_name}" -m owner --gid-owner ${gid} -j RETURN
+        done
+      fi
+      append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}"
+      append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}"
+      if [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ]; then
+        if uid_list_has_entries || [ "${gid_list}" != "" ]; then
+          log Info "代理模式: ${proxy_mode} (${packages_list[*]}) 不透明代理。"
+        else
+          log Info "所有应用透明代理。"
+        fi
+      fi
+      ;;
+    whitelist|white)
+      if uid_list_has_entries; then
+        while read -r appid; do
+          append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}" "uid-owner" "${appid}"
+          append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}" "uid-owner" "${appid}"
+        done < "${uid_list}"
+        append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}" "uid-owner" "0"
+        append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}" "uid-owner" "0"
+        append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}" "uid-owner" "1052"
+        append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}" "uid-owner" "1052"
+      else
+        append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}"
+        append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}"
+      fi
+      if [ "${gid_list}" != "" ] ; then
+        for gid in ${gid_list[@]} ; do
+          append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}" "gid-owner" "${gid}"
+          append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}" "gid-owner" "${gid}"
+        done
+      fi
+      [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ] && {
+        if uid_list_has_entries || [ "${gid_list}" != "" ]; then
+          log Info "代理模式: ${proxy_mode} (${packages_list[*]}) 透明代理。"
+        else
+          log Info "所有应用透明代理。"
+        fi
+      }
+      ;;
+    *)
+      log Warning "代理模式: ${proxy_mode} 配置错误。"
+      append_local_protocol_rule "${table_name}" "${chain_name}" tcp "${action}"
+      append_local_protocol_rule "${table_name}" "${chain_name}" udp "${action}"
+      [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ] && log Info "所有应用透明代理。"
+      ;;
+  esac
+}
+
+loopback_addr() {
+  if [ "${iptables}" = "$IPV" ]; then
+    printf '127.0.0.1\n'
+  else
+    printf '::1\n'
+  fi
+}
+
+tun_bypass_pre_chain() {
+  if [ "${iptables}" = "$IPV" ]; then
+    printf 'BOX_TUN_BYPASS_PRE\n'
+  else
+    printf 'BOX_TUN_BYPASS6_PRE\n'
+  fi
+}
+
+tun_bypass_out_chain() {
+  if [ "${iptables}" = "$IPV" ]; then
+    printf 'BOX_TUN_BYPASS_OUT\n'
+  else
+    printf 'BOX_TUN_BYPASS6_OUT\n'
+  fi
+}
+
+tun_bypass_family_label() {
+  if [ "${iptables}" = "$IPV" ]; then
+    printf 'IPv4\n'
+  else
+    printf 'IPv6\n'
+  fi
+}
+
+current_cnip_set_name() {
+  if [ "${iptables}" = "$IPV" ]; then
+    [ "${bypass_cn_ip_v4}" = "true" ] && printf 'cnip\n'
+  else
+    [ "${bypass_cn_ip_v6}" = "true" ] && printf 'cnip6\n'
+  fi
+}
+
+append_mark_and_return_rule() {
+  local table_name="$1"
+  local chain_name="$2"
+  local mark_value="$3"
+  shift 3
+
+  ensure_rule_append "${table_name}" "${chain_name}" "$@" -j MARK --set-xmark "${mark_value}"
+  ensure_rule_append "${table_name}" "${chain_name}" "$@" -j RETURN
+}
+
+append_tun_dns_rules() {
+  local chain_name="$1"
+  dns_mode_is_disable && return 0
+
+  if dns_tcp_enabled; then
+    append_mark_and_return_rule mangle "${chain_name}" "${tun_route_mark}" -p tcp --dport 53
+  fi
+  if dns_udp_enabled; then
+    append_mark_and_return_rule mangle "${chain_name}" "${tun_route_mark}" -p udp --dport 53
+  fi
+}
+
+append_tun_bypass_destination_rules() {
+  local chain_name="$1"
+  local set_name=""
+
+  if [ "${iptables}" = "$IPV" ]; then
+    for subnet in ${intranet[@]} ; do
+      ensure_rule_append mangle "${chain_name}" -d ${subnet} -j RETURN
+    done
+  else
+    for subnet6 in ${intranet6[@]} ; do
+      ensure_rule_append mangle "${chain_name}" -d ${subnet6} -j RETURN
+    done
+  fi
+
+  if [ "${bypass_cn_ip}" = "true" ] && command -v ipset >/dev/null 2>&1; then
+    set_name="$(current_cnip_set_name)"
+    [ -n "${set_name}" ] && ensure_rule_append mangle "${chain_name}" -m set --match-set "${set_name}" dst -j MARK --set-xmark "${tun_bypass_mark}"
+  fi
+
+  ensure_rule_append mangle "${chain_name}" -m mark --mark "${tun_bypass_mark}" -j RETURN
+  ensure_rule_append mangle "${chain_name}" -j MARK --set-xmark "${tun_route_mark}"
+}
+
+append_tun_proxy_mode_rules() {
+  local chain_name="$1"
+
+  case "${proxy_mode}" in
+    blacklist|black)
+      if uid_list_has_entries; then
+        while read -r appid; do
+          ensure_rule_append mangle "${chain_name}" -m owner --uid-owner "${appid}" -j RETURN
+        done < "${uid_list}"
+      fi
+      if [ "${gid_list}" != "" ]; then
+        for gid in ${gid_list[@]}; do
+          ensure_rule_append mangle "${chain_name}" -m owner --gid-owner ${gid} -j RETURN
+        done
+      fi
+      ;;
+    whitelist|white)
+      if uid_list_has_entries; then
+        while read -r appid; do
+          ensure_rule_append mangle "${chain_name}" -m owner --uid-owner "${appid}" -j MARK --set-xmark "${tun_route_mark}"
+        done < "${uid_list}"
+      fi
+      if [ "${gid_list}" != "" ]; then
+        for gid in ${gid_list[@]}; do
+          ensure_rule_append mangle "${chain_name}" -m owner --gid-owner ${gid} -j MARK --set-xmark "${tun_route_mark}"
+        done
+      fi
+      if uid_list_has_entries || [ "${gid_list}" != "" ]; then
+        ensure_rule_append mangle "${chain_name}" -j RETURN
+      fi
+      ;;
+  esac
+}
+
+apply_tun_local_proxy_rules() {
+  local chain_name="$1"
+
+  ensure_rule_insert mangle "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  append_tun_proxy_mode_rules "${chain_name}"
+}
+
+apply_tun_route_rules() {
+  if [ "${iptables}" = "$IPV" ]; then
+    ensure_ip_rule ip "${tun_bypass_mark}" "main" "${tun_bypass_pref}"
+    ensure_ip_rule ip "${tun_route_mark}" "${tun_route_table}" "${tun_route_pref}"
+    ip route replace default dev "${tun_device}" table "${tun_route_table}" >/dev/null 2>&1 || return 1
+  else
+    ensure_ip_rule "ip -6" "${tun_bypass_mark}" "main" "${tun_bypass_pref}"
+    ensure_ip_rule "ip -6" "${tun_route_mark}" "${tun_route_table}" "${tun_route_pref}"
+    ip -6 route replace default dev "${tun_device}" table "${tun_route_table}" >/dev/null 2>&1 || return 1
+  fi
+
+  log Debug "TUN 导流(${family_label}): 规则写入完成。"
+}
+
+cleanup_tun_route_rules() {
+  if [ "${iptables}" = "$IPV" ]; then
+    del_ip_rule_if_exists ip "${tun_bypass_mark}" "main" "${tun_bypass_pref}"
+    del_ip_rule_if_exists ip "${tun_route_mark}" "${tun_route_table}" "${tun_route_pref}"
+    ip route flush table "${tun_route_table}" >/dev/null 2>&1 || true
+  else
+    del_ip_rule_if_exists "ip -6" "${tun_bypass_mark}" "main" "${tun_bypass_pref}"
+    del_ip_rule_if_exists "ip -6" "${tun_route_mark}" "${tun_route_table}" "${tun_route_pref}"
+    ip -6 route flush table "${tun_route_table}" >/dev/null 2>&1 || true
+  fi
+}
+
+apply_loopback_reject_rule() {
+  local port="$1"
+  ensure_rule_append filter OUTPUT -d "$(loopback_addr)" -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${port}" -j REJECT
+}
+
+cleanup_loopback_reject_rule() {
+  local port="$1"
+  del_rule_silent filter OUTPUT -d "$(loopback_addr)" -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${port}" -j REJECT
+  if [ "${iptables}" = "$IPV" ]; then
+    del_rule_silent filter OUTPUT -d "$(loopback_addr)" -p tcp -m owner --uid-owner 0:3005 -m tcp --dport "${port}" -j REJECT
+    del_rule_silent filter OUTPUT -d "$(loopback_addr)" -p tcp -m owner --uid-owner 0 --gid-owner 3005 -m tcp --dport "${port}" -j REJECT
+  else
+    del_rule_silent filter OUTPUT -d "$(loopback_addr)" -p tcp -m owner --uid-owner 0:3005 -m tcp --dport "${port}" -j REJECT
+    del_rule_silent filter OUTPUT -d "$(loopback_addr)" -p tcp -m owner --uid-owner 0 --gid-owner 3005 -m tcp --dport "${port}" -j REJECT
+  fi
+}
+
+apply_quic_block_rules() {
+  [ "${quic}" = "disable" ] || return 0
+  [ "${proxy_udp}" = "true" ] || return 0
+  ensure_rule_append filter OUTPUT -p udp --dport 443 -j REJECT
+  ensure_rule_append filter OUTPUT -p udp --dport 80 -j REJECT
+  [ "${iptables}" = "$IPV" ] && log Warning "已禁用 QUIC"
+}
+
+cleanup_quic_block_rules() {
+  del_rule_silent filter OUTPUT -p udp -m multiport --dport 443,80 -j REJECT
+  del_rule_silent filter OUTPUT -p udp --dport 443 -j REJECT
+  del_rule_silent filter OUTPUT -p udp --dport 80 -j REJECT
+}
+
+cleanup_dns_nat_hijack_chains() {
+  if [ "${iptables}" = "$IPV" ]; then
+    del_jump_silent nat PREROUTING NAT_DNS_HIJACK
+    del_jump_silent nat OUTPUT NAT_DNS_HIJACK
+    cleanup_chain_fast nat NAT_DNS_HIJACK
+    del_jump_silent nat PREROUTING NAT_DNS_FORWARD
+    del_jump_silent nat OUTPUT NAT_DNS_FORWARD
+    cleanup_chain_fast nat NAT_DNS_FORWARD
+  else
+    del_jump_silent nat PREROUTING NAT_DNS_HIJACK6
+    del_jump_silent nat OUTPUT NAT_DNS_HIJACK6
+    cleanup_chain_fast nat NAT_DNS_HIJACK6
+    del_jump_silent nat PREROUTING NAT_DNS_FORWARD6
+    del_jump_silent nat OUTPUT NAT_DNS_FORWARD6
+    cleanup_chain_fast nat NAT_DNS_FORWARD6
+  fi
+}
+
+cleanup_legacy_mihomo_dns_chains() {
+  [ "${iptables}" = "$IPV" ] || return 0
+  del_jump_silent nat PREROUTING MIHOMO_DNS_EXTERNAL
+  del_jump_silent nat OUTPUT MIHOMO_DNS_LOCAL
+  cleanup_chain_fast nat MIHOMO_DNS_EXTERNAL
+  cleanup_chain_fast nat MIHOMO_DNS_LOCAL
+}
+
+setup_fake_ip_icmp_rules() {
+  [ "${iptables}" = "$IPV" ] || return 0
+  [[ "${bin_name}" == @(mihomo|sing-box) ]] || return 0
+  [ -n "${fake_ip_range}" ] || return 0
+  ensure_rule_insert nat OUTPUT -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+  ensure_rule_insert nat PREROUTING -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+}
+
+cleanup_fake_ip_icmp_rules() {
+  [ "${iptables}" = "$IPV" ] || return 0
+  [ -n "${fake_ip_range}" ] || return 0
+  del_rule_silent nat OUTPUT -p icmp -d "${fake_ip_range}" -j DNAT --to-destination 127.0.0.1
+  del_rule_silent nat PREROUTING -p icmp -d "${fake_ip_range}" -j DNAT --to-destination 127.0.0.1
+  del_rule_silent nat OUTPUT -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+  del_rule_silent nat PREROUTING -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+}
+
+setup_tproxy_policy_routing() {
+  if [ "${iptables}" = "$IPV" ]; then
+    ensure_ip_rule ip "${fwmark}" "${table}" "${pref}"
+    ensure_ip_route_local_default ip "${table}"
+  else
+    ensure_ip_rule "ip -6" "${fwmark}" "${table}" "${pref}"
+    ensure_ip_route_local_default "ip -6" "${table}"
+  fi
+}
+
+cleanup_tproxy_policy_routing() {
+  if [ "${iptables}" = "$IPV" ]; then
+    del_ip_rule_if_exists ip "${fwmark}" "${table}" "${pref}"
+    del_ip_route_local_default_if_exists ip "${table}"
+    ip route flush table "${table}" >/dev/null 2>&1 || true
+    ip rule del pref "${pref}" >/dev/null 2>&1 || true
+  else
+    del_ip_rule_if_exists "ip -6" "${fwmark}" "${table}" "${pref}"
+    del_ip_route_local_default_if_exists "ip -6" "${table}"
+    ip -6 route flush table "${table}" >/dev/null 2>&1 || true
+    ip -6 rule del pref "${pref}" >/dev/null 2>&1 || true
+  fi
+}
+
+apply_tproxy_ipv6_fakeip_rules() {
+  local chain_name="$1"
+  local action="$2"
+
+  [ "${iptables}" = "$IP6V" ] || return 0
+  [ -n "${fake_ip6_range}" ] || return 0
+  [ "${bin_name}" = "mihomo" ] || return 0
+
+  case "${action}" in
+    tproxy)
+      if [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+        ensure_rule_append mangle "${chain_name}" -p tcp -d "${fake_ip6_range}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+      fi
+      if [ "${proxy_udp}" = "true" ]; then
+        ensure_rule_append mangle "${chain_name}" -p udp -d "${fake_ip6_range}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+      fi
+      ;;
+    mark)
+      if [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+        ensure_rule_append mangle "${chain_name}" -p tcp -d "${fake_ip6_range}" -j MARK --set-xmark "${fwmark}"
+      fi
+      if [ "${proxy_udp}" = "true" ]; then
+        ensure_rule_append mangle "${chain_name}" -p udp -d "${fake_ip6_range}" -j MARK --set-xmark "${fwmark}"
+      fi
+      ;;
+  esac
+}
+
+performance_conntrack_enabled() {
+  [ "${performance_mode}" = "true" ] || return 1
+  [ "${cap_conntrack_match}" = "true" ] || return 1
+  return 0
+}
+
+performance_connmark_enabled() {
+  [ "${performance_mode}" = "true" ] || return 1
+  [ "${cap_conntrack_match}" = "true" ] || return 1
+  [ "${cap_connmark_match}" = "true" ] || return 1
+  [ "${cap_connmark_target}" = "true" ] || return 1
+  return 0
+}
+
+redirect_performance_chain_enabled() {
+  performance_connmark_enabled
+}
+
+tproxy_performance_chain_enabled() {
+  performance_connmark_enabled || return 1
+  if [ "${network_mode}" != "enhance" ] && [ "${cap_socket_transparent}" != "true" ]; then
+    return 1
+  fi
+  if [ "${network_mode}" = "enhance" ] && [ "${proxy_udp}" != "true" ]; then
+    return 1
+  fi
+  return 0
+}
+
+apply_tproxy_reply_bypass_rules() {
+  local chain_name="$1"
+  performance_conntrack_enabled || return 0
+  ensure_rule_append mangle "${chain_name}" -m conntrack --ctdir REPLY -j RETURN
+}
+
+apply_redirect_reply_bypass_rules() {
+  local chain_name="$1"
+  performance_conntrack_enabled || return 0
+  ensure_rule_append nat "${chain_name}" -m conntrack --ctdir REPLY -j RETURN
+}
+
+append_tproxy_dispatch_rule() {
+  local chain_name="$1"
+  shift
+
+  ensure_rule_append mangle "${chain_name}" "$@" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+}
+
+apply_tproxy_performance_rules() {
+  [ "${performance_mode}" = "true" ] || return 0
+
+  if [ "${iptables}" = "$IPV" ]; then
+    if tproxy_performance_chain_enabled; then
+      if [ "${network_mode}" = "enhance" ]; then
+        log Info "性能模式：Enhance 下 TCP 使用 REDIRECT 子链，UDP 使用 TPROXY 子链。"
+      else
+        log Info "性能模式：TPROXY 已启用性能优化规则。"
+      fi
+    elif [ "${network_mode}" = "enhance" ] && [ "${proxy_udp}" != "true" ]; then
+      log Info "性能模式：Enhance 当前未启用 UDP 代理，已跳过 TPROXY 子链优化。"
+    elif [ "${network_mode}" != "enhance" ] && [ "${cap_socket_match}" = "true" ] && [ "${cap_socket_transparent}" != "true" ]; then
+      log Warning "性能模式已开启，但内核不支持 socket --transparent，TPROXY 回退为普通规则。"
+    elif performance_conntrack_enabled; then
+      log Warning "性能模式已开启，但内核缺少 connmark 支持，TPROXY 回退为普通规则。"
+    else
+      log Warning "性能模式已开启，但未检测到可用的 conntrack / connmark 支持，TPROXY 回退为普通规则。"
+    fi
+  fi
+}
+
+append_tproxy_perf_connmark_rules() {
+  local chain_name="$1"
+
+  if [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+    ensure_rule_append mangle "${chain_name}" -p tcp -m conntrack --ctstate NEW,RELATED -j CONNMARK --set-xmark "${fwmark}"
+  fi
+  if [ "${proxy_udp}" = "true" ]; then
+    ensure_rule_append mangle "${chain_name}" -p udp -m conntrack --ctstate NEW,RELATED -j CONNMARK --set-xmark "${fwmark}"
+  fi
+}
+
+tproxy_perf_pre_ip_chain() {
+  printf 'BOX_TP_PRE_IP\n'
+}
+
+tproxy_perf_pre_if_chain() {
+  printf 'BOX_TP_PRE_IF\n'
+}
+
+tproxy_perf_out_ip_chain() {
+  printf 'BOX_TP_OUT_IP\n'
+}
+
+tproxy_perf_out_app_chain() {
+  printf 'BOX_TP_OUT_APP\n'
+}
+
+redirect_perf_pre_ip_chain() {
+  printf 'BOX_RD_PRE_IP\n'
+}
+
+redirect_perf_pre_if_chain() {
+  printf 'BOX_RD_PRE_IF\n'
+}
+
+redirect_perf_out_ip_chain() {
+  printf 'BOX_RD_OUT_IP\n'
+}
+
+redirect_perf_out_app_chain() {
+  printf 'BOX_RD_OUT_APP\n'
+}
+
+add_perf_chain_jumps() {
+  local table_name="$1"
+  local parent_chain="$2"
+  shift 2
+  local target
+  for target in "$@"; do
+    if [ "${proxy_tcp}" = "true" ]; then
+      if [ "${table_name}" != "mangle" ] || [ "${network_mode}" != "enhance" ]; then
+        ensure_rule_append "${table_name}" "${parent_chain}" -p tcp --syn -j "${target}"
+      fi
+    fi
+    if [ "${table_name}" = "mangle" ] && [ "${proxy_udp}" = "true" ]; then
+      ensure_rule_append "${table_name}" "${parent_chain}" -p udp -m conntrack --ctstate NEW,RELATED -j "${target}"
+    fi
+  done
+}
+
+setup_perf_dest_chain() {
+  local table_name="$1"
+  local chain_name="$2"
+  ensure_chain "${table_name}" "${chain_name}"
+
+  # 避免本地/内网 DNS 在性能模式下被提前旁路。
+  append_perf_bypass_target() {
+    local _table_name="$1"
+    local _chain_name="$2"
+    shift 2
+    ensure_rule_append "${_table_name}" "${_chain_name}" "$@" -p udp ! --dport 53 -j ACCEPT
+    ensure_rule_append "${_table_name}" "${_chain_name}" "$@" ! -p udp -j ACCEPT
+  }
+
+  if [ "${iptables}" = "$IPV" ]; then
+    for subnet in ${intranet[@]} ; do
+      append_perf_bypass_target "${table_name}" "${chain_name}" -d ${subnet}
+    done
+    if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ] && command -v ipset >/dev/null 2>&1; then
+      append_perf_bypass_target "${table_name}" "${chain_name}" -m set --match-set cnip dst
+    fi
+  else
+    for subnet6 in ${intranet6[@]} ; do
+      append_perf_bypass_target "${table_name}" "${chain_name}" -d ${subnet6}
+    done
+    if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v6}" = "true" ] && command -v ipset >/dev/null 2>&1; then
+      append_perf_bypass_target "${table_name}" "${chain_name}" -m set --match-set cnip6 dst
+    fi
+  fi
+
+  append_perf_bypass_target "${table_name}" "${chain_name}" -m addrtype --dst-type LOCAL
+  # addrtype 在部分设备不可用时的回退：显式回环地址兜底
+  if [ "${iptables}" = "$IPV" ]; then
+    append_perf_bypass_target "${table_name}" "${chain_name}" -d 127.0.0.0/8
+  else
+    append_perf_bypass_target "${table_name}" "${chain_name}" -d ::1/128
+  fi
+}
+
+setup_perf_pre_if_chain() {
+  local table_name="$1"
+  local chain_name="$2"
+  ensure_chain "${table_name}" "${chain_name}"
+
+  if [ "${ignore_ap_list}" != "" ]; then
+    for ignore in "${ignore_ap_list[@]}"; do
+      ensure_rule_append "${table_name}" "${chain_name}" -i "${ignore}" -j ACCEPT
+    done
+  fi
+
+  ensure_rule_append "${table_name}" "${chain_name}" -i lo -j RETURN
+
+  if [ "${ap_list}" = "" ]; then
+    ensure_rule_append "${table_name}" "${chain_name}" -j ACCEPT
+    return 0
+  fi
+
+  for ap in "${ap_list[@]}"; do
+    if [ "${mac_filter}" = "true" ]; then
+      if [ "${mac_mode}" = "whitelist" ]; then
+        for mac_item in "${macs_list[@]}"; do
+          local mac
+          mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
+          echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
+          ensure_rule_append "${table_name}" "${chain_name}" -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
+        done
+        ensure_rule_append "${table_name}" "${chain_name}" -i "${ap}" -j ACCEPT
+      else
+        for mac_item in "${macs_list[@]}"; do
+          local mac
+          mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
+          echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
+          ensure_rule_append "${table_name}" "${chain_name}" -i "${ap}" -m mac --mac-source "${mac}" -j ACCEPT
+        done
+        ensure_rule_append "${table_name}" "${chain_name}" -i "${ap}" -j RETURN
+      fi
+    else
+      ensure_rule_append "${table_name}" "${chain_name}" -i "${ap}" -j RETURN
+    fi
+  done
+
+  ensure_rule_append "${table_name}" "${chain_name}" -j ACCEPT
+}
+
+setup_perf_out_app_chain() {
+  local table_name="$1"
+  local chain_name="$2"
+  ensure_chain "${table_name}" "${chain_name}"
+
+  case "${proxy_mode}" in
+    blacklist|black)
+      if uid_list_has_entries; then
+        while read -r appid; do
+          ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner "${appid}" -j ACCEPT
+        done < "${uid_list}"
+      fi
+      if [ "${gid_list}" != "" ]; then
+        for gid in ${gid_list[@]} ; do
+          ensure_rule_append "${table_name}" "${chain_name}" -m owner --gid-owner ${gid} -j ACCEPT
+        done
+      fi
+      ;;
+    whitelist|white)
+      local _has_whitelist="false"
+      if uid_list_has_entries; then
+        while read -r appid; do
+          ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner "${appid}" -j RETURN
+        done < "${uid_list}"
+        ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner 0 -j RETURN
+        ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner 1052 -j RETURN
+        _has_whitelist="true"
+      fi
+      if [ "${gid_list}" != "" ]; then
+        for gid in ${gid_list[@]} ; do
+          ensure_rule_append "${table_name}" "${chain_name}" -m owner --gid-owner ${gid} -j RETURN
+        done
+        _has_whitelist="true"
+      fi
+      if [ "${_has_whitelist}" = "true" ]; then
+        ensure_rule_append "${table_name}" "${chain_name}" -j ACCEPT
+      fi
+      ;;
+  esac
+}
+
+setup_redirect_perf_external_chain() {
+  local ip_chain
+  local if_chain
+
+  ip_chain="$(redirect_perf_pre_ip_chain)"
+  if_chain="$(redirect_perf_pre_if_chain)"
+
+  setup_external_chain_common nat BOX_EXTERNAL
+  apply_redirect_reply_bypass_rules BOX_EXTERNAL
+  ensure_dns_nat_hijack
+  setup_perf_dest_chain nat "${ip_chain}"
+  setup_perf_pre_if_chain nat "${if_chain}"
+
+  add_perf_chain_jumps nat BOX_EXTERNAL "${ip_chain}" "${if_chain}"
+
+  if [ "${proxy_tcp}" = "true" ]; then
+    apply_redirect_connmark_restore_rules BOX_EXTERNAL
+    ensure_rule_append nat BOX_EXTERNAL -p tcp -m conntrack --ctstate NEW,RELATED -j CONNMARK --set-xmark "${fwmark}"
+    ensure_rule_append nat BOX_EXTERNAL -p tcp -m connmark --mark "${fwmark}" -j REDIRECT --to-ports "${redir_port}"
+  fi
+
+  finish_external_chain nat BOX_EXTERNAL
+}
+
+setup_redirect_perf_local_chain() {
+  local ip_chain
+  local app_chain
+
+  ip_chain="$(redirect_perf_out_ip_chain)"
+  app_chain="$(redirect_perf_out_app_chain)"
+
+  setup_local_chain_common nat BOX_LOCAL
+  apply_redirect_reply_bypass_rules BOX_LOCAL
+  append_cnip_force_proxy_local_rules nat BOX_LOCAL redirect
+  setup_perf_dest_chain nat "${ip_chain}"
+  setup_perf_out_app_chain nat "${app_chain}"
+
+  add_perf_chain_jumps nat BOX_LOCAL "${app_chain}" "${ip_chain}"
+
+  if [ "${proxy_tcp}" = "true" ]; then
+    apply_redirect_connmark_restore_rules BOX_LOCAL
+    ensure_rule_append nat BOX_LOCAL -p tcp -m conntrack --ctstate NEW,RELATED -j CONNMARK --set-xmark "${fwmark}"
+    ensure_rule_append nat BOX_LOCAL -p tcp -m connmark --mark "${fwmark}" -j REDIRECT --to-ports "${redir_port}"
+  fi
+
+  finish_local_chain nat BOX_LOCAL
+}
+
+cleanup_perf_chains() {
+  local table_name="$1"
+  shift
+  local chain_name
+  for chain_name in "$@"; do
+    cleanup_chain_fast "${table_name}" "${chain_name}"
+  done
+}
+
+setup_tproxy_perf_external_chain() {
+  local ip_chain
+  local if_chain
+
+  ip_chain="$(tproxy_perf_pre_ip_chain)"
+  if_chain="$(tproxy_perf_pre_if_chain)"
+
+  setup_external_chain_common mangle BOX_EXTERNAL
+  setup_perf_dest_chain mangle "${ip_chain}"
+  setup_perf_pre_if_chain mangle "${if_chain}"
+
+  apply_tproxy_reply_bypass_rules BOX_EXTERNAL
+  apply_mangle_dns_rules BOX_EXTERNAL tproxy
+  apply_tproxy_ipv6_fakeip_rules BOX_EXTERNAL tproxy
+
+  add_perf_chain_jumps mangle BOX_EXTERNAL "${ip_chain}" "${if_chain}"
+
+  append_tproxy_perf_connmark_rules BOX_EXTERNAL
+  if [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+    ensure_rule_append mangle BOX_EXTERNAL -p tcp -m connmark --mark "${fwmark}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+  fi
+  if [ "${proxy_udp}" = "true" ]; then
+    ensure_rule_append mangle BOX_EXTERNAL -p udp -m connmark --mark "${fwmark}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+  fi
+
+  finish_external_chain mangle BOX_EXTERNAL
+}
+
+setup_tproxy_perf_local_chain() {
+  local ip_chain
+  local app_chain
+
+  ip_chain="$(tproxy_perf_out_ip_chain)"
+  app_chain="$(tproxy_perf_out_app_chain)"
+
+  setup_local_chain_common mangle BOX_LOCAL
+  setup_perf_dest_chain mangle "${ip_chain}"
+  setup_perf_out_app_chain mangle "${app_chain}"
+
+  apply_tproxy_reply_bypass_rules BOX_LOCAL
+  apply_tproxy_ipv6_fakeip_rules BOX_LOCAL mark
+  append_cnip_force_proxy_local_rules mangle BOX_LOCAL mark
+
+  add_perf_chain_jumps mangle BOX_LOCAL "${ip_chain}" "${app_chain}"
+  apply_mangle_dns_rules BOX_LOCAL mark
+
+  append_tproxy_perf_connmark_rules BOX_LOCAL
+  if [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
+    ensure_rule_append mangle BOX_LOCAL -p tcp -m connmark --mark "${fwmark}" -j MARK --set-xmark "${fwmark}"
+  fi
+  if [ "${proxy_udp}" = "true" ]; then
+    ensure_rule_append mangle BOX_LOCAL -p udp -m connmark --mark "${fwmark}" -j MARK --set-xmark "${fwmark}"
+  fi
+
+  finish_local_chain mangle BOX_LOCAL
+}
+
+setup_tproxy_external_chain() {
+  apply_tproxy_performance_rules
+  if tproxy_performance_chain_enabled; then
+    setup_tproxy_perf_external_chain
+    return 0
+  fi
+
+  setup_external_chain_common mangle BOX_EXTERNAL
+  apply_tproxy_reply_bypass_rules BOX_EXTERNAL
+  apply_mangle_dns_rules BOX_EXTERNAL tproxy
+  apply_tproxy_ipv6_fakeip_rules BOX_EXTERNAL tproxy
+  append_common_bypass_rules mangle BOX_EXTERNAL
+  apply_ignored_external_interfaces mangle BOX_EXTERNAL
+  apply_external_loopback_rule mangle BOX_EXTERNAL tproxy
+  apply_external_ap_rules mangle BOX_EXTERNAL tproxy
+  finish_external_chain mangle BOX_EXTERNAL
+}
+
+setup_tproxy_local_chain() {
+  if tproxy_performance_chain_enabled; then
+    setup_tproxy_perf_local_chain
+    return 0
+  fi
+
+  setup_local_chain_common mangle BOX_LOCAL
+  apply_tproxy_reply_bypass_rules BOX_LOCAL
+  apply_mangle_dns_rules BOX_LOCAL mark
+  apply_tproxy_ipv6_fakeip_rules BOX_LOCAL mark
+  append_cnip_force_proxy_local_rules mangle BOX_LOCAL mark
+  append_common_bypass_rules mangle BOX_LOCAL
+  apply_local_proxy_rules mangle BOX_LOCAL mark
+  finish_local_chain mangle BOX_LOCAL
+}
+
+setup_tproxy_divert_chain() {
+  if [ "${network_mode}" = "enhance" ] || [ "${cap_socket_match}" != "true" ] || ! tproxy_performance_chain_enabled; then
+    cleanup_tproxy_divert_chain
+    return 0
+  fi
+
+  ensure_chain mangle DIVERT
+  ensure_rule_append mangle DIVERT -j MARK --set-xmark "${fwmark}"
+  ensure_rule_append mangle DIVERT -j ACCEPT
+  ensure_rule_insert mangle PREROUTING -p tcp -m socket --transparent -j DIVERT
+}
+
+cleanup_tproxy_divert_chain() {
+  del_rule_silent mangle PREROUTING -p tcp -m socket --transparent -j DIVERT
+  del_rule_silent mangle PREROUTING -p tcp -m socket -j DIVERT
+  cleanup_chain_fast mangle DIVERT
+}
+
+setup_external_chain_common() {
+  local table_name="$1"
+  local chain_name="$2"
+  ensure_chain "${table_name}" "${chain_name}"
+}
+
+finish_external_chain() {
+  local table_name="$1"
+  local chain_name="$2"
+  local parent_chain="${3:-PREROUTING}"
+  ensure_jump "${table_name}" "${parent_chain}" "${chain_name}"
+}
+
+cleanup_external_chain_common() {
+  local table_name="$1"
+  local chain_name="$2"
+  local parent_chain="${3:-PREROUTING}"
+  del_jump_silent "${table_name}" "${parent_chain}" "${chain_name}"
+  cleanup_chain_fast "${table_name}" "${chain_name}"
+}
+
+setup_local_chain_common() {
+  local table_name="$1"
+  local chain_name="$2"
+  local core_bypass_added="false"
+  ensure_chain "${table_name}" "${chain_name}"
+
+  if ${iptables} -t "${table_name}" -I "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN >/dev/null 2>&1; then
+    core_bypass_added="true"
+  elif ${iptables} -t "${table_name}" -I "${chain_name}" -m owner --uid-owner "${box_user}" -j RETURN >/dev/null 2>&1; then
+    core_bypass_added="true"
+  elif ${iptables} -t "${table_name}" -I "${chain_name}" -m owner --gid-owner "${box_group}" -j RETURN >/dev/null 2>&1; then
+    core_bypass_added="true"
+  fi
+
+  if [ "${core_bypass_added}" != "true" ]; then
+    ensure_rule_insert "${table_name}" "${chain_name}" -m mark --mark "${fwmark}" -j RETURN
+    [ "${iptables}" = "$IPV" ] && log Warning "owner 匹配不可用，核心进程旁路已降级为 mark 规则。"
+  fi
+}
+
+finish_local_chain() {
+  local table_name="$1"
+  local chain_name="$2"
+  local parent_chain="${3:-OUTPUT}"
+  ensure_jump "${table_name}" "${parent_chain}" "${chain_name}"
+}
+
+cleanup_local_chain_common() {
+  local table_name="$1"
+  local chain_name="$2"
+  local parent_chain="${3:-OUTPUT}"
+
+  del_jump_silent "${table_name}" "${parent_chain}" "${chain_name}"
+  cleanup_chain_fast "${table_name}" "${chain_name}"
+
+  if [ "${table_name}" = "nat" ] || [ "${table_name}" = "mangle" ]; then
+    if [ "${iptables}" = "$IPV" ]; then
+      cleanup_chain_fast "${table_name}" LOCAL_IP_V4
+    else
+      cleanup_chain_fast "${table_name}" LOCAL_IP_V6
+    fi
+  fi
+}
+
+setup_redirect_local_chain() {
+  if redirect_performance_chain_enabled; then
+    setup_redirect_perf_local_chain
+    return 0
+  fi
+
+  setup_local_chain_common nat BOX_LOCAL
+  apply_redirect_reply_bypass_rules BOX_LOCAL
+  append_cnip_force_proxy_local_rules nat BOX_LOCAL redirect
+  append_common_bypass_rules nat BOX_LOCAL
+  apply_redirect_connmark_restore_rules BOX_LOCAL
+  apply_local_proxy_rules nat BOX_LOCAL redirect
+  finish_local_chain nat BOX_LOCAL
+}
+
+setup_redirect_external_chain() {
+  apply_redirect_performance_rules
+  if redirect_performance_chain_enabled; then
+    setup_redirect_perf_external_chain
+    return 0
+  fi
+
+  setup_external_chain_common nat BOX_EXTERNAL
+  apply_redirect_reply_bypass_rules BOX_EXTERNAL
+  ensure_dns_nat_hijack
+  append_common_bypass_rules nat BOX_EXTERNAL
+  apply_ignored_external_interfaces nat BOX_EXTERNAL
+  apply_redirect_connmark_restore_rules BOX_EXTERNAL
+  apply_external_loopback_rule nat BOX_EXTERNAL redirect
+  apply_external_ap_rules nat BOX_EXTERNAL redirect
+  finish_external_chain nat BOX_EXTERNAL
+}
+
+append_external_protocol_rule() {
+  local table_name="$1"
+  local chain_name="$2"
+  local action="$3"
+  local proto="$4"
+  local iface="$5"
+  local mac="$6"
+
+  case "${action}" in
+    redirect)
+      [ "${proto}" = "tcp" ] || return 0
+      [ "${proxy_tcp}" = "true" ] || return 0
+      set -- -p tcp -i "${iface}"
+      [ -n "${mac}" ] && set -- "$@" -m mac --mac-source "${mac}"
+      append_redirect_dispatch_rule "${chain_name}" "$@"
+      ;;
+    tproxy)
+      if [ "${proto}" = "tcp" ]; then
+        [ "${proxy_tcp}" = "true" ] || return 0
+        [ "${network_mode}" != "enhance" ] || return 0
+      else
+        [ "${proxy_udp}" = "true" ] || return 0
+      fi
+      set -- -p "${proto}" -i "${iface}"
+      [ -n "${mac}" ] && set -- "$@" -m mac --mac-source "${mac}"
+      append_tproxy_dispatch_rule "${chain_name}" "$@"
+      ;;
+  esac
+}
+
+apply_ignored_external_interfaces() {
+  local table_name="$1"
+  local chain_name="$2"
+
+  if [ "${ignore_ap_list}" != "" ]; then
+    for ignore in "${ignore_ap_list[@]}"; do
+      ensure_rule_append "${table_name}" "${chain_name}" -i "${ignore}" -j RETURN
+    done
+    [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ] && log Info "${ignore_ap_list[*]} 入站接口已忽略透明代理。"
+  fi
+}
+
+apply_external_loopback_rule() {
+  local table_name="$1"
+  local chain_name="$2"
+  local action="$3"
+
+  case "${action}" in
+    redirect)
+      append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" tcp lo
+      ;;
+    tproxy)
+      append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" tcp lo
+      append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" udp lo
+      ;;
+  esac
+}
+
+apply_external_ap_rules() {
+  local table_name="$1"
+  local chain_name="$2"
+  local action="$3"
+
+  [ "${ap_list}" != "" ] || return 0
+
+  for ap in "${ap_list[@]}"; do
+    if [ "${mac_filter}" = "true" ]; then
+      if [ "${mac_mode}" = "whitelist" ]; then
+        local _mac_added="false"
+        for mac_item in "${macs_list[@]}"; do
+          local mac
+          mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
+          echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
+          append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" tcp "${ap}" "${mac}"
+          append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" udp "${ap}" "${mac}"
+          _mac_added="true"
+        done
+        if [ "${_mac_added}" != "true" ]; then
+          [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ] && log Warning "热点接口 ${ap}：MAC 白名单已启用但列表为空/无有效项，将不代理该接口的客户端流量"
+        fi
+      else
+        for mac_item in "${macs_list[@]}"; do
+          local mac
+          mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
+          echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
+          if [ "${action}" = "redirect" ]; then
+            ensure_rule_append "${table_name}" "${chain_name}" -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
+          else
+            [ "${network_mode}" != "enhance" ] && [ "${proxy_tcp}" = "true" ] && ensure_rule_append "${table_name}" "${chain_name}" -p tcp -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
+            [ "${proxy_udp}" = "true" ] && ensure_rule_append "${table_name}" "${chain_name}" -p udp -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
+          fi
+        done
+        append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" tcp "${ap}"
+        append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" udp "${ap}"
+      fi
+    else
+      append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" tcp "${ap}"
+      append_external_protocol_rule "${table_name}" "${chain_name}" "${action}" udp "${ap}"
+    fi
+  done
+
+  [ "${iptables}" = "$IPV" ] && [ "${network_mode}" != "enhance" ] && {
+    if [ "${mac_filter}" = "true" ]; then
+      if [ "${mac_mode}" = "whitelist" ]; then
+        log Info "${ap_list[*]} 热点 MAC 白名单透明代理已启用。"
+      else
+        log Info "${ap_list[*]} 热点 MAC 黑名单透明代理已启用。"
+      fi
+    else
+      log Info "${ap_list[*]} 透明代理。"
+    fi
+  }
+}
+
 case "${bin_name}" in
   "mihomo")
     mihomo_mode=$(busybox awk '!/^ *#/ && /mode: / { print $2;found=1; exit } END{ if(!found) print "rules" }' "${mihomo_config}" 2>/dev/null)
@@ -353,6 +1731,7 @@ case "${bin_name}" in
     mihomo_dns_port=${mihomo_dns_port:-1053}
     if [[ "${network_mode}" == @(mixed|tun) ]]; then
       tun_device=$(busybox awk '!/^ *#/ && /device: / { print $2;found=1; exit } END{ if(!found) print "meta" }' "${mihomo_config}" 2>/dev/null)
+      stack=$(busybox awk '!/^ *#/ && /stack: / { print $2;found=1; exit } END{ if(!found) print "'"${stack}"'" }' "${mihomo_config}" 2>/dev/null)
     fi
     ;;
   "sing-box")
@@ -361,6 +1740,8 @@ case "${bin_name}" in
       if [ -z "$tun_device" ]; then
         tun_device="tun0"
       fi
+      _stack=$(busybox grep -oE '"stack": "[^"]*' "${sing_config}" | busybox awk -F'"' '{print $4}' 2>/dev/null | head -n 1)
+      [ -n "${_stack}" ] && stack="${_stack}"
     fi
     fake_ip_range=$(busybox awk -F'"' '/inet4_range/ {print $4}' "${sing_config}")
     fake_ip6_range=$(busybox awk -F'"' '/inet6_range/ {print $4}' "${sing_config}")
@@ -372,14 +1753,14 @@ case "${bin_name}" in
         true
         ;;
       *)
-        log Warning "$bin_name 不支持 network_mode: $network_mode，已切换回 TProxy"
+        log Warning "$bin_name 不支持网络模式: $network_mode，已切换到 TPROXY"
         sed -i 's/\(network_mode=\)\"[^\"]*\"/\1"tproxy"/g' ${settings}
         ;;
     esac
     ;;
   "xray" | "v2fly")
     if [[ "${network_mode}" != "tproxy" ]]; then
-      log Warning "$bin_name 不支持 network_mode: $network_mode，已切换回 TProxy"
+      log Warning "$bin_name 不支持网络模式: $network_mode，已切换到 TPROXY"
       sed -i 's/\(network_mode=\)\"[^\"]*\"/\1"tproxy"/g' ${settings}
     fi
     ;;
@@ -392,7 +1773,7 @@ esac
 box_etc() {
   case "${bin_name}" in
     mihomo)
-      log Debug "增强模式: $mihomo_enhanced_mode, fake-ip 段: $fake_ip_range, fake-ip6 段: ${fake_ip6_range:-none}, DNS 端口: $mihomo_dns_port, 模式: $mihomo_mode"
+      log Debug "enhanced-mode: $mihomo_enhanced_mode, fake-ip 段: $fake_ip_range, fake-ip6 段: ${fake_ip6_range:-none}, DNS 端口: $mihomo_dns_port, 模式: $mihomo_mode"
       ;;
     sing-box)
       if [ -n "${fake_ip_range}" ] && [ "${bin_name}" = "sing-box" ]; then
@@ -404,7 +1785,7 @@ box_etc() {
       ;;
   esac
   if [[ "${network_mode}" == @(mixed|tun) ]]; then
-    log Info "TUN 设备: ($tun_device)"
+    log Info "TUN 设备: ($tun_device), 协议栈: ${stack}"
   fi
 }
 
@@ -447,7 +1828,7 @@ disable_ipv6() {
   sysctl -w net.ipv6.conf.default.disable_ipv6=1
   sysctl -w net.ipv6.conf.wlan0.disable_ipv6=1
 
-  # 新增：彻底阻断 IPv6
+  # 添加不可达规则，阻断 IPv6 流量继续转发。
   ip -6 rule show pref "${pref}" 2>/dev/null | busybox grep -q "unreachable" || ip -6 rule add unreachable pref "${pref}"
 } >/dev/null 2>&1
 
@@ -461,11 +1842,11 @@ ipv6_enable() {
   sysctl -w net.ipv6.conf.default.disable_ipv6=0
   sysctl -w net.ipv6.conf.wlan0.disable_ipv6=0
 
-  # 删除：彻底阻断 IPv6
+  # 移除不可达规则，恢复 IPv6 路由。
   ip -6 rule show pref "${pref}" 2>/dev/null | busybox grep -q "unreachable" && ip -6 rule del unreachable pref "${pref}" >/dev/null 2>&1 || true
 
-  # 新增：阻止所有 IPv6 的 53 端口 UDP 出站流量，防止 IPv6 DNS 泄漏
-  iptables="$IP6V" && ensure_rule_append filter OUTPUT -p udp --destination-port 53 -j DROP
+  # 这里不全局阻断 IPv6 DNS，避免影响 TUN 模式下的 DNS 转发。
+  del_rule_silent filter OUTPUT -p udp --destination-port 53 -j DROP 2>/dev/null || true
 } >/dev/null 2>&1
 
 intranet=(
@@ -487,7 +1868,7 @@ intranet=(
   255.255.255.0/24
   255.255.255.255/32
 )
-# 100.0.0.0/8 的使用是中国电信运营商的错误，建议改回 100.64.0.0/10。
+# 同时补充设备当前已有的 IPv4 地址段，避免本机地址被误导流。
 intranet+=($(ip -4 a | busybox awk '/inet/ {print $2}' | busybox grep -vE "^127.0.0.1"))
 
 intranet6=(
@@ -507,19 +1888,19 @@ intranet6=(
 )
 intranet6+=($(ip -6 a | busybox awk '/inet6/ {print $2}' | busybox grep -vE "^fe80|^::1|^fd00"))
 
-# IPv6 NAT 支持探测
+# 检测内核是否支持 ip6tables nat 表。
 ip6_nat_supported() {
   ip6tables -t nat -L >/dev/null 2>&1
 }
 
-# CN ipset 载入/清理
+# 中国大陆 IP 集的载入与清理。
 setup_cn_ipset() {
-  [ "${bypass_cn_ip}" = "true" ] || { log Debug "CN 分流未启用"; return 0; }
+  [ "${bypass_cn_ip}" = "true" ] || { log Debug "大陆IP分流未启用"; return 0; }
   if ! command -v ipset >/dev/null 2>&1; then
-    log Warning "ipset 不可用，跳过 CN 分流"
+    log Warning "ipset 不可用，跳过大陆IP分流"
     return 1
   fi
-  # IPv4
+  # 载入中国大陆 IPv4 地址段。
   if [ "${bypass_cn_ip_v4}" = "true" ] && [ -f "${cn_ip_file}" ]; then
     if {
       echo "create cnip hash:net family inet hashsize 8192 maxelem 65536 -exist"
@@ -533,7 +1914,7 @@ setup_cn_ipset() {
   else
     log Debug "跳过 IPv4 ipset 载入（未启用或文件不存在）"
   fi
-  # IPv6
+  # 载入中国大陆 IPv6 地址段。
   if [ "${ipv6}" = "true" ]; then
     if [ "${bypass_cn_ip_v6}" = "true" ] && [ -f "${cn_ipv6_file}" ]; then
       if {
@@ -557,13 +1938,27 @@ cleanup_cn_ipset() {
   ipset flush cnip6 2>/dev/null || true
 }
 probe_tun_device() {
-  busybox ifconfig | grep -q "${tun_device}" || return 1
+  ip link show "${tun_device}" >/dev/null 2>&1 && return 0
+  busybox ifconfig "${tun_device}" >/dev/null 2>&1 && return 0
+  busybox ifconfig 2>/dev/null | busybox awk -F: -v dev="${tun_device}" '$1==dev {found=1} END{exit !found}'
+}
+
+wait_tun_device() {
+  local timeout="${1:-12}"
+  local interval="${2:-1}"
+  local elapsed=0
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    probe_tun_device && return 0
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+  done
+  return 1
 }
 
 forward() {
   local action=$1
 
-  # ${iptables} -t nat "${action}" POSTROUTING -o ${tun_device} -j MASQUERADE
+  # 如需 NAT 出口，可在此补充 MASQUERADE。
 
   if [ "${action}" = "-D" ]; then
     del_rule_if_exists filter FORWARD -i "${tun_device}" -j ACCEPT
@@ -579,209 +1974,73 @@ forward() {
 
 } >/dev/null 2>&1
 
+start_tun_bypass() {
+  local pre_chain out_chain family_label
+  pre_chain="$(tun_bypass_pre_chain)"
+  out_chain="$(tun_bypass_out_chain)"
+  family_label="$(tun_bypass_family_label)"
+
+  ensure_chain mangle "${pre_chain}"
+  ensure_chain mangle "${out_chain}"
+
+  ensure_rule_append mangle "${pre_chain}" -i "${tun_device}" -j RETURN
+  append_tun_dns_rules "${pre_chain}"
+  append_tun_bypass_destination_rules "${pre_chain}"
+
+  append_tun_dns_rules "${out_chain}"
+  append_cnip_force_proxy_tun_rules "${out_chain}"
+  apply_tun_local_proxy_rules "${out_chain}"
+  append_tun_bypass_destination_rules "${out_chain}"
+
+  ensure_jump mangle PREROUTING "${pre_chain}" || {
+    stop_tun_bypass >/dev/null 2>&1
+    return 1
+  }
+  ensure_jump mangle OUTPUT "${out_chain}" || {
+    stop_tun_bypass >/dev/null 2>&1
+    return 1
+  }
+  apply_tun_route_rules || {
+    stop_tun_bypass >/dev/null 2>&1
+    return 1
+  }
+}
+
+stop_tun_bypass() {
+  local pre_chain out_chain
+  pre_chain="$(tun_bypass_pre_chain)"
+  out_chain="$(tun_bypass_out_chain)"
+
+  cleanup_tun_route_rules
+  del_jump_silent mangle PREROUTING "${pre_chain}"
+  del_jump_silent mangle OUTPUT "${out_chain}"
+  cleanup_chain_fast mangle "${pre_chain}"
+  cleanup_chain_fast mangle "${out_chain}"
+}
+
 start_redirect() {
-  # IPv6: 若当前在 ip6tables 环境，且配置为 redirect，并且内核支持 IPv6 NAT，则创建 NAT_DNS_HIJACK6
-  if [ "${iptables}" = "$IP6V" ] && [ "${dns_hijack_mode}" = "redirect" ] && ip6_nat_supported; then
-    local _dns_port6
-    _dns_port6="${mihomo_dns_port}"; [ -z "${_dns_port6}" ] && _dns_port6="1053"
-    setup_nat_dns_hijack "NAT_DNS_HIJACK6" "${_dns_port6}" "6"
-  fi
-  if [ "${iptables}" = "$IPV" ]; then
-    ensure_chain nat BOX_EXTERNAL
-    ensure_chain nat BOX_LOCAL
+  if [ "${iptables}" = "$IP6V" ] && ! ip6_nat_supported; then
+    [ "${ipv6}" = "true" ] && log Warning "ip6tables NAT 不可用，跳过 IPv6 重定向规则"
+    return 0
   fi
 
-  if [ "${iptables}" = "$IPV" ]; then
-    # DNS 劫持策略（redirect：创建 NAT_DNS_HIJACK；disable：不处理；其他：保留 mihomo 的 UDP DNS 重定向）
-    if [ "${dns_hijack_mode}" = "redirect" ]; then
-      local _dns_port
-      _dns_port="${mihomo_dns_port}"
-      [ -z "${_dns_port}" ] && _dns_port="1053"
-      setup_nat_dns_hijack "NAT_DNS_HIJACK" "${_dns_port}" "4"
-    fi
-    if [ "${dns_hijack_mode}" != "redirect" ] && [ "${dns_hijack_mode}" != "disable" ] && [ "${bin_name}" = "mihomo" ]; then
-      if [ "${dns_hijack_udp}" = "true" ]; then
-        ensure_rule_append nat BOX_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${mihomo_dns_port}"
-        ensure_rule_append nat BOX_LOCAL -p udp --dport 53 -j REDIRECT --to-ports "${mihomo_dns_port}"
-      fi
-    # 其他类型的入站应在此处添加以接收 DNS 流量而不是嗅探
-    # ${iptables} -t nat -A BOX_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${redir_port}"
-    # ${iptables} -t nat -A BOX_LOCAL -p udp --dport 53 -j REDIRECT --to-ports "${redir_port}"
-    fi
+  setup_redirect_external_chain
+  setup_redirect_local_chain
 
-    # 修复 ICMP（ping），这不能保证 ping 结果有效，仅保证有返回
-    # if [[ "${bin_name}" == @(mihomo|sing-box) ]]; then
-      # if [ -n "${fake_ip_range}" ]; then
-        # ${iptables} -t nat -A BOX_EXTERNAL -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
-        # ${iptables} -t nat -A BOX_LOCAL -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
-      # fi
-    # fi
-
-    ensure_chain nat LOCAL_IP_V4
-    
-    for subnet in ${intranet[@]} ; do
-      ensure_rule_append nat BOX_EXTERNAL -d ${subnet} -j RETURN
-      ensure_rule_append nat BOX_LOCAL -d ${subnet} -j RETURN
-    done
-    # 中国大陆 IP 分流（IPv4 NAT）
-    if [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ] && command -v ipset >/dev/null 2>&1; then
-      ensure_rule_append nat BOX_EXTERNAL -m set --match-set cnip dst -j RETURN
-      ensure_rule_append nat BOX_LOCAL -m set --match-set cnip dst -j RETURN
-    fi
-    
-    ensure_rule_append nat BOX_EXTERNAL -j LOCAL_IP_V4
-    ensure_rule_append nat BOX_LOCAL -j LOCAL_IP_V4
-
-    # 在允许列表之前优先跳过指定接口
-    if [ "${ignore_ap_list}" != "" ]; then
-      for ignore in "${ignore_ap_list[@]}"; do
-        ensure_rule_append nat BOX_EXTERNAL -i "${ignore}" -j RETURN
-      done
-      [ ${network_mode} = "enhance" ] || log Info "${ignore_ap_list[*]} 入站接口已忽略透明代理。"
-    fi
-
-    # 对非环回接口的所有TCP流量进行重定向，避免硬编码接口名称
-    if [ "${proxy_tcp}" = "true" ]; then
-      ensure_rule_append nat BOX_EXTERNAL -p tcp -i lo -j REDIRECT --to-ports "${redir_port}"
-    fi
-
-    if [ "${ap_list}" != "" ]; then
-      for ap in "${ap_list[@]}"; do
-        if [ "${proxy_tcp}" = "true" ]; then
-          if [ "${mac_filter}" = "true" ]; then
-            if [ "${mac_mode}" = "whitelist" ]; then
-              local _mac_added="false"
-              for mac_item in "${macs_list[@]}"; do
-                local mac
-                mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
-                echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
-                ensure_rule_append nat BOX_EXTERNAL -p tcp -i "${ap}" -m mac --mac-source "${mac}" -j REDIRECT --to-ports "${redir_port}"
-                _mac_added="true"
-              done
-              if [ "${_mac_added}" != "true" ]; then
-                [ ${network_mode} = "enhance" ] || log Warning "热点接口 ${ap}：MAC 白名单已启用但列表为空/无有效项，将不代理该接口的客户端流量"
-              fi
-            else
-              for mac_item in "${macs_list[@]}"; do
-                local mac
-                mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
-                echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
-                ensure_rule_append nat BOX_EXTERNAL -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
-              done
-              ensure_rule_append nat BOX_EXTERNAL -p tcp -i "${ap}" -j REDIRECT --to-ports "${redir_port}"
-            fi
-          else
-            ensure_rule_append nat BOX_EXTERNAL -p tcp -i "${ap}" -j REDIRECT --to-ports "${redir_port}"
-          fi
-        fi
-      done
-
-      if [ "${mac_filter}" = "true" ]; then
-        if [ "${mac_mode}" = "whitelist" ]; then
-          [ ${network_mode} = "enhance" ] || log Info "${ap_list[*]} 热点 MAC 白名单透明代理已启用。"
-        else
-          [ ${network_mode} = "enhance" ] || log Info "${ap_list[*]} 热点 MAC 黑名单透明代理已启用。"
-        fi
-      else
-        [ ${network_mode} = "enhance" ] || log Info "${ap_list[*]} 透明代理。"
-      fi
-    fi
-
-    ensure_jump nat PREROUTING BOX_EXTERNAL
-    ensure_rule_insert nat BOX_LOCAL -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
-  fi
-
-  if [ "${iptables}" = "$IPV" ]; then
-    case "${proxy_mode}" in
-      core)
-        ensure_rule_append nat BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
-        [ ${network_mode} = "enhance" ] || log Info "核心模式：所有应用透明代理。"
-        ;;
-      blacklist|black)
-        if [ -z "$(cat "${uid_list}")" ] ; then
-          ensure_rule_append nat BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
-          [ ${network_mode} = "enhance" ] || log Info "所有应用透明代理。"
-        else
-          while read -r appid; do
-            ensure_rule_append nat BOX_LOCAL -m owner --uid-owner "${appid}" -j RETURN
-          done < "${uid_list}"
-          ensure_rule_append nat BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
-          [ ${network_mode} = "enhance" ] || log Info "代理模式: ${proxy_mode} (${packages_list[*]}) 不透明代理。"
-        fi
-
-        if [ "${gid_list}" != "" ] ; then
-          for gid in ${gid_list[@]} ; do
-            ensure_rule_append nat BOX_LOCAL -m owner --gid-owner ${gid} -j RETURN
-          done
-          [ ${network_mode} = "enhance" ] || {
-            [ "${iptables}" = "$IPV" ] &&  log Info "代理模式: ${proxy_mode}, GID (${gid_list[*]}) 不透明代理。"
-          }
-        fi
-        ;;
-      whitelist|white)
-        if [ -z "$(cat "${uid_list}")" ] ; then
-          ensure_rule_append nat BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
-          [ ${network_mode} = "enhance" ] || log Info "所有应用透明代理。"
-        else
-          while read -r appid; do
-            ensure_rule_append nat BOX_LOCAL -p tcp -m owner --uid-owner "${appid}" -j REDIRECT --to-ports "${redir_port}"
-          done < "${uid_list}"
-          ensure_rule_append nat BOX_LOCAL -p tcp -m owner --uid-owner 0 -j REDIRECT --to-ports "${redir_port}"
-          ensure_rule_append nat BOX_LOCAL -p tcp -m owner --uid-owner 1052 -j REDIRECT --to-ports "${redir_port}"
-          [ ${network_mode} = "enhance" ] || log Info "代理模式: ${proxy_mode} (${packages_list[*]}) 透明代理。"
-        fi
-
-        if [ "${gid_list}" != "" ] ; then
-          for gid in ${gid_list[@]} ; do
-            ensure_rule_append nat BOX_LOCAL -p tcp -m owner --gid-owner ${gid} -j REDIRECT --to-ports ${redir_port}
-          done
-          [ ${network_mode} = "enhance" ] || [ "${iptables}" = "$IPV" ] && log Info "代理模式: ${proxy_mode}, GID (${gid_list[*]}) 透明代理。"
-        fi
-        ;;
-      *)
-        log Warning "代理模式: ${proxy_mode} 配置错误。"
-        ensure_rule_append nat BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
-        [ ${network_mode} = "enhance" ] || log Info "所有应用透明代理。"
-        ;;
-    esac
-  fi
-
-  if [ "${iptables}" = "$IPV" ]; then
-    ensure_jump nat OUTPUT BOX_LOCAL
-  fi
-
-  if [ "${iptables}" = "$IPV" ]; then
-    ensure_rule_append filter OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
-  else
-    ensure_rule_append filter OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
-  fi
+  apply_loopback_reject_rule "${redir_port}"
 }
 
 stop_redirect() {
-  if [ "${iptables}" = "$IPV" ]; then
-    del_jump_silent nat PREROUTING BOX_EXTERNAL
-    del_jump_silent nat OUTPUT BOX_LOCAL
+  cleanup_loopback_reject_rule "${redir_port}"
 
-    del_rule_silent filter OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
-    del_rule_silent filter OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner 0:3005 -m tcp --dport "${redir_port}" -j REJECT
-
-    cleanup_chain_fast nat BOX_EXTERNAL
-    cleanup_chain_fast nat BOX_LOCAL
-    cleanup_chain_fast nat LOCAL_IP_V4
-
-    del_jump_silent nat PREROUTING NAT_DNS_HIJACK
-    del_jump_silent nat OUTPUT NAT_DNS_HIJACK
-    cleanup_chain_fast nat NAT_DNS_HIJACK
-  else
-    del_rule_silent filter OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
-    del_rule_silent filter OUTPUT -d ::1 -p tcp -m owner --uid-owner 0:3005 -m tcp --dport "${redir_port}" -j REJECT
-  fi
-
-  if [ "${iptables}" = "$IP6V" ]; then
-    del_jump_silent nat PREROUTING NAT_DNS_HIJACK6
-    del_jump_silent nat OUTPUT NAT_DNS_HIJACK6
-    cleanup_chain_fast nat NAT_DNS_HIJACK6
-  fi
+  cleanup_external_chain_common nat BOX_EXTERNAL
+  cleanup_local_chain_common nat BOX_LOCAL
+  cleanup_perf_chains nat \
+    "$(redirect_perf_pre_ip_chain)" \
+    "$(redirect_perf_pre_if_chain)" \
+    "$(redirect_perf_out_ip_chain)" \
+    "$(redirect_perf_out_app_chain)"
+  cleanup_dns_nat_hijack_chains
 }
 
 start_tproxy() {
@@ -790,485 +2049,146 @@ start_tproxy() {
     return 1
   fi
 
-  if [ "${iptables}" = "$IPV" ]; then
-    ensure_ip_rule ip "${fwmark}" "${table}" "${pref}"
-    ensure_ip_route_local_default ip "${table}"
-  else
-    ensure_ip_rule "ip -6" "${fwmark}" "${table}" "${pref}"
-    ensure_ip_route_local_default "ip -6" "${table}"
-  fi
+  setup_tproxy_policy_routing
+  setup_tproxy_external_chain
+  setup_tproxy_local_chain
+  setup_tproxy_divert_chain
 
-  ensure_chain mangle BOX_EXTERNAL
+  apply_quic_block_rules
 
-  # ${iptables} -t mangle -A BOX_EXTERNAL -m mark --mark ${routing_mark} -j RETURN
-
-  # 跳过部分接口，注意：有些接口名为 r_ / oem / nm_ / qcom_，可能需要更复杂的处理
-  # ${iptables} -t mangle -I BOX_EXTERNAL -i rmnet_data+ -j RETURN
-  # ${iptables} -t mangle -I BOX_EXTERNAL -i ccmni+ -j RETURN
-
-  if [ "${dns_hijack_mode}" = "redirect" ]; then
-      if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_EXTERNAL -p tcp --dport 53 -j RETURN
-      fi
-      if [ "${dns_hijack_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_EXTERNAL -p udp --dport 53 -j RETURN
-      fi
-  elif [ "${dns_hijack_mode}" = "disable" ]; then
-      if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_EXTERNAL -p tcp --dport 53 -j RETURN
-      fi
-      if [ "${dns_hijack_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_EXTERNAL -p udp --dport 53 -j RETURN
-      fi
-  else
-      if [ "${mihomo_dns_forward}" = "enable" ] && [[ "${bin_name}" == @(mihomo|hysteria) ]] ; then
-        if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_EXTERNAL -p tcp --dport 53 -j RETURN
-        fi
-        if [ "${dns_hijack_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_EXTERNAL -p udp --dport 53 -j RETURN
-        fi
-      else
-        if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_EXTERNAL -p tcp --dport 53 -j TPROXY --on-port ${tproxy_port} --tproxy-mark ${fwmark}
-        fi
-        if [ "${dns_hijack_udp}" = "true" ] && [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_EXTERNAL -p udp --dport 53 -j TPROXY --on-port ${tproxy_port} --tproxy-mark ${fwmark}
-        fi
-      fi
-  fi
-
-  # NAT DNS 劫持链在后续（本地防回环规则之后）统一创建，避免重复插入
-
-  # 跳过已被 TProxy 处理的流量，若默认路由接口有公网 IP，省略这些规则会导致本地流量代理异常，可能拖慢全网
-  # if [ "${cap_socket_match}" = "true" ]; then
-  #   if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-  #     ensure_rule_append mangle BOX_EXTERNAL -p tcp -m socket --transparent -j MARK --set-xmark ${fwmark}
-  #   fi
-  #   if [ "${proxy_udp}" = "true" ]; then
-  #     ensure_rule_append mangle BOX_EXTERNAL -p udp -m socket --transparent -j MARK --set-xmark ${fwmark}
-  #   fi
-  #   if [ "${proxy_tcp}" = "true" ] || [ "${proxy_udp}" = "true" ]; then
-  #     ensure_rule_append mangle BOX_EXTERNAL -m socket -j RETURN
-  #   fi
-  # else
-  #   [ "${iptables}" = "$IPV" ] && log Warning "未检测到 socket match，跳过部分优化规则（不影响基本功能）"
-  # fi
-
-  # 跳过内网，兼容性可用 su -c 'zcat /proc/config.gz | grep -i addrtype' 检查
-  # ${iptables} -t mangle -A BOX_EXTERNAL -m addrtype --dst-type LOCAL -j RETURN
-  if [ "${iptables}" = "$IPV" ]; then
-    for subnet in ${intranet[@]} ; do
-      ensure_rule_append mangle BOX_EXTERNAL -d ${subnet} -j RETURN
-    done
-    ensure_chain mangle LOCAL_IP_V4
-    [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ] && command -v ipset >/dev/null 2>&1 && ensure_rule_append mangle BOX_EXTERNAL -m set --match-set cnip dst -j RETURN
-    ensure_rule_append mangle BOX_EXTERNAL -j LOCAL_IP_V4
-  else
-    # 优先处理 IPv6 fake-ip，避免被 intranet6 (包含 fc00::/7) 提前放行
-    if [ -n "${fake_ip6_range}" ] && [ "${bin_name}" = "mihomo" ]; then
-      if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_EXTERNAL -p tcp -d "${fake_ip6_range}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-      fi
-      if [ "${proxy_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_EXTERNAL -p udp -d "${fake_ip6_range}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-      fi
-    fi
-    for subnet6 in ${intranet6[@]} ; do
-      ensure_rule_append mangle BOX_EXTERNAL -d ${subnet6} -j RETURN
-    done
-    ensure_chain mangle LOCAL_IP_V6
-    [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v6}" = "true" ] && command -v ipset >/dev/null 2>&1 && ensure_rule_append mangle BOX_EXTERNAL -m set --match-set cnip6 dst -j RETURN
-    ensure_rule_append mangle BOX_EXTERNAL -j LOCAL_IP_V6
-  fi
-
-  # 在任何 TPROXY 规则之前优先生效，防止被后续 allow 接口（如 wlan+）覆盖
-  if [ "${ignore_ap_list}" != "" ]; then
-    for ignore in ${ignore_ap_list[@]} ; do
-      ensure_rule_append mangle BOX_EXTERNAL -i "${ignore}" -j RETURN
-    done
-    [ "${iptables}" = "$IPV" ] && log Info "${ignore_ap_list[*]} 入站接口已忽略透明代理。"
-  fi
-
-  if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-    ensure_rule_append mangle BOX_EXTERNAL -p tcp -i lo -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-  fi
-  if [ "${proxy_udp}" = "true" ]; then
-    ensure_rule_append mangle BOX_EXTERNAL -p udp -i lo -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-  fi
-
-  # 允许 ap 接口，注意：老设备只有一个 wlan，新设备可能有多个（如 wlan0 上网，wlan1 AP），遍历 ap 列表
-  if [ "${ap_list}" != "" ]; then
-    for ap in ${ap_list[@]} ; do
-      if [ "${mac_filter}" = "true" ]; then
-        if [ "${mac_mode}" = "whitelist" ]; then
-          local _mac_added="false"
-          for mac_item in "${macs_list[@]}"; do
-            local mac
-            mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
-            echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
-            if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-              ensure_rule_append mangle BOX_EXTERNAL -p tcp -i "${ap}" -m mac --mac-source "${mac}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-            fi
-            if [ "${proxy_udp}" = "true" ]; then
-              ensure_rule_append mangle BOX_EXTERNAL -p udp -i "${ap}" -m mac --mac-source "${mac}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-            fi
-            _mac_added="true"
-          done
-          if [ "${_mac_added}" != "true" ]; then
-            [ "${iptables}" = "$IPV" ] && [ ${network_mode} != "enhance" ] && log Warning "热点接口 ${ap}：MAC 白名单已启用但列表为空/无有效项，将不代理该接口的客户端流量"
-          fi
-        else
-          for mac_item in "${macs_list[@]}"; do
-            local mac
-            mac="$(echo "${mac_item}" | busybox tr '[:upper:]' '[:lower:]' | busybox tr -d '[:space:]')"
-            echo "${mac}" | busybox grep -Eq '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$' || continue
-            if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-              ensure_rule_append mangle BOX_EXTERNAL -p tcp -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
-            fi
-            if [ "${proxy_udp}" = "true" ]; then
-              ensure_rule_append mangle BOX_EXTERNAL -p udp -i "${ap}" -m mac --mac-source "${mac}" -j RETURN
-            fi
-          done
-          if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-            ensure_rule_append mangle BOX_EXTERNAL -p tcp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-          fi
-          if [ "${proxy_udp}" = "true" ]; then
-            ensure_rule_append mangle BOX_EXTERNAL -p udp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-          fi
-        fi
-      else
-        if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_EXTERNAL -p tcp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-        fi
-        if [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_EXTERNAL -p udp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
-        fi
-      fi
-    done
-    if [ "${iptables}" = "$IPV" ]; then
-      if [ "${mac_filter}" = "true" ]; then
-        if [ "${mac_mode}" = "whitelist" ]; then
-          [ ${network_mode} = "enhance" ] || log Info "${ap_list[*]} 热点 MAC 白名单透明代理已启用。"
-        else
-          [ ${network_mode} = "enhance" ] || log Info "${ap_list[*]} 热点 MAC 黑名单透明代理已启用。"
-        fi
-      else
-        [ ${network_mode} = "enhance" ] || log Info "${ap_list[*]} 透明代理。"
-      fi
-    fi
-  fi
-
-  ensure_jump mangle PREROUTING BOX_EXTERNAL
-  ensure_chain mangle BOX_LOCAL
-
-  ensure_rule_insert mangle BOX_LOCAL -m owner --uid-owner ${box_user} --gid-owner ${box_group} -j RETURN
-  # ${iptables} -t mangle -A BOX_LOCAL -m mark --mark ${routing_mark} -j RETURN
-
-  if [ "${dns_hijack_mode}" = "redirect" ] || [ "${dns_hijack_mode}" = "disable" ]; then
-      if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p tcp --dport 53 -j RETURN
-      fi
-      if [ "${dns_hijack_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p udp --dport 53 -j RETURN
-      fi
-  else
-      if [ "${mihomo_dns_forward}" = "enable" ] && [[ "${bin_name}" == @(mihomo|hysteria) ]] ; then
-        if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp --dport 53 -j RETURN
-        fi
-        if [ "${dns_hijack_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp --dport 53 -j RETURN
-        fi
-      else
-        if [ ${network_mode} != "enhance" ] && [ "${dns_hijack_tcp}" = "true" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp --dport 53 -j MARK --set-xmark ${fwmark}
-        fi
-        if [ "${dns_hijack_udp}" = "true" ] && [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp --dport 53 -j MARK --set-xmark ${fwmark}
-        fi
-      fi
-  fi
-
-  if [ "${iptables}" = "$IPV" ]; then
-    for subnet in ${intranet[@]} ; do
-      ensure_rule_append mangle BOX_LOCAL -d ${subnet} -j RETURN
-    done
-    [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v4}" = "true" ] && command -v ipset >/dev/null 2>&1 && ensure_rule_append mangle BOX_LOCAL -m set --match-set cnip dst -j RETURN
-    ensure_rule_append mangle BOX_LOCAL -j LOCAL_IP_V4
-  else
-    # 为本地发起的 IPv6 fake-ip 目的流量优先打标，避免被 intranet6 提前放行
-    if [ -n "${fake_ip6_range}" ] && [ "${bin_name}" = "mihomo" ]; then
-      if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p tcp -d "${fake_ip6_range}" -j MARK --set-xmark "${fwmark}"
-      fi
-      if [ "${proxy_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p udp -d "${fake_ip6_range}" -j MARK --set-xmark "${fwmark}"
-      fi
-    fi
-    for subnet6 in ${intranet6[@]} ; do
-      ensure_rule_append mangle BOX_LOCAL -d ${subnet6} -j RETURN
-    done
-    [ "${bypass_cn_ip}" = "true" ] && [ "${bypass_cn_ip_v6}" = "true" ] && command -v ipset >/dev/null 2>&1 && ensure_rule_append mangle BOX_LOCAL -m set --match-set cnip6 dst -j RETURN
-    ensure_rule_append mangle BOX_LOCAL -j LOCAL_IP_V6
-  fi
-
-  case "${proxy_mode}" in
-    core)
-      if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
-      fi
-      if [ "${proxy_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
-      fi
-      [ "${iptables}" = "$IPV" ] && log Info "核心模式：所有应用透明代理。"
-      ;;
-    blacklist|black)
-      if [ -z "$(cat "${uid_list}")" ] ; then
-        if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
-        fi
-        if [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
-        fi
-        [ "${iptables}" = "$IPV" ] && log Info "所有应用透明代理。"
-      else
-        while read -r appid; do
-          ensure_rule_append mangle BOX_LOCAL -m owner --uid-owner "${appid}" -j RETURN
-        done < "${uid_list}"
-        if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
-        fi
-        if [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
-        fi
-        [ "${iptables}" = "$IPV" ] && log Info "代理模式: ${proxy_mode} (${packages_list[*]}) 不透明代理。"
-      fi
-
-      if [ "${gid_list}" != "" ] ; then
-        for gid in ${gid_list[@]} ; do
-          ensure_rule_append mangle BOX_LOCAL -m owner --gid-owner ${gid} -j RETURN
-        done
-        [ "${iptables}" = "$IPV" ] && log Info "代理模式: ${proxy_mode}, GID (${gid_list[*]}) 不透明代理。"
-      fi
-      ;;
-    whitelist|white)
-      if [ -z "$(cat "${uid_list}")" ] ; then
-        if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
-        fi
-        if [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
-        fi
-        [ "${iptables}" = "$IPV" ] && log Info "所有应用透明代理。"
-      else
-        while read -r appid; do
-          if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-            ensure_rule_append mangle BOX_LOCAL -p tcp -m owner --uid-owner "${appid}" -j MARK --set-xmark "${fwmark}"
-          fi
-          if [ "${proxy_udp}" = "true" ]; then
-            ensure_rule_append mangle BOX_LOCAL -p udp -m owner --uid-owner "${appid}" -j MARK --set-xmark "${fwmark}"
-          fi
-        done < "${uid_list}"
-        if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp -m owner --uid-owner 0 -j MARK --set-xmark "${fwmark}"
-        fi
-        if [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp -m owner --uid-owner 0 -j MARK --set-xmark "${fwmark}"
-        fi
-        if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p tcp -m owner --uid-owner 1052 -j MARK --set-xmark "${fwmark}"
-        fi
-        if [ "${proxy_udp}" = "true" ]; then
-          ensure_rule_append mangle BOX_LOCAL -p udp -m owner --uid-owner 1052 -j MARK --set-xmark "${fwmark}"
-        fi
-        [ "${iptables}" = "$IPV" ] && log Info "代理模式: ${proxy_mode} (${packages_list[*]}) 透明代理。"
-      fi
-
-      if [ "${gid_list}" != "" ] ; then
-        for gid in ${gid_list[@]} ; do
-          if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-            ensure_rule_append mangle BOX_LOCAL -p tcp -m owner --gid-owner ${gid} -j MARK --set-xmark "${fwmark}"
-          fi
-          if [ "${proxy_udp}" = "true" ]; then
-            ensure_rule_append mangle BOX_LOCAL -p udp -m owner --gid-owner ${gid} -j MARK --set-xmark "${fwmark}"
-          fi
-        done
-        [ "${iptables}" = "$IPV" ] && log Info "代理模式: ${proxy_mode}, GID (${gid_list[*]}) 透明代理。"
-      fi
-      ;;
-    *)
-      log Debug "代理模式: ${proxy_mode} 配置错误"
-      if [ ${network_mode} != "enhance" ] && [ "${proxy_tcp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p tcp -j MARK --set-xmark "${fwmark}"
-      fi
-      if [ "${proxy_udp}" = "true" ]; then
-        ensure_rule_append mangle BOX_LOCAL -p udp -j MARK --set-xmark "${fwmark}"
-      fi
-      [ "${iptables}" = "$IPV" ] && log Info "所有应用透明代理。"
-      ;;
-    esac
-
-  ensure_jump mangle OUTPUT BOX_LOCAL
-
-  ensure_chain mangle DIVERT
-  ensure_rule_append mangle DIVERT -j MARK --set-xmark "${fwmark}"
-  ensure_rule_append mangle DIVERT -j ACCEPT
   if [ ${network_mode} != "enhance" ]; then
-    if [ "${cap_socket_match}" = "true" ]; then
-      ensure_rule_insert mangle PREROUTING -p tcp -m socket -j DIVERT
-    fi
+    # 阻止本地直接访问 TPROXY 端口，避免流量回环。
+    apply_loopback_reject_rule "${tproxy_port}"
   fi
 
-  # 禁用 QUIC
-  if [ "${quic}" = "disable" ] && [ "${proxy_udp}" = "true" ]; then
-    ensure_rule_append filter OUTPUT -p udp --dport 443 -j REJECT
-    ensure_rule_append filter OUTPUT -p udp --dport 80 -j REJECT
-    # ${iptables} -A OUTPUT -p udp -m multiport --dport 443,80 -j REJECT
-    [ "${iptables}" = "$IPV" ] && log Warning "已禁用 QUIC"
-  fi
-
-if [ ${network_mode} != "enhance" ]; then
-  # 阻止本地访问 tproxy 端口，防止流量回环
-  if [ "${iptables}" = "$IPV" ]; then
-    ensure_rule_append filter OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
-  else
-    ensure_rule_append filter OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
-  fi
-fi
-
-  if [ "${iptables}" = "$IPV" ]; then
-    if [ "${dns_hijack_mode}" = "redirect" ]; then
-      local _dns_port
-      _dns_port="${mihomo_dns_port}"
-      [ -z "${_dns_port}" ] && _dns_port="1053"
-      setup_nat_dns_hijack "NAT_DNS_HIJACK" "${_dns_port}" "4"
-    elif [ "${mihomo_dns_forward}" = "enable" ] && [ "${bin_name}" = "mihomo" ]; then
-      ensure_chain nat MIHOMO_DNS_EXTERNAL
-      ensure_rule_append nat MIHOMO_DNS_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${mihomo_dns_port}"
-      ensure_jump nat PREROUTING MIHOMO_DNS_EXTERNAL
-
-      ensure_chain nat MIHOMO_DNS_LOCAL
-      ensure_rule_insert nat MIHOMO_DNS_LOCAL -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
-      ensure_rule_append nat MIHOMO_DNS_LOCAL -p udp --dport 53 -j REDIRECT --to-ports "${mihomo_dns_port}"
-      ensure_jump nat OUTPUT MIHOMO_DNS_LOCAL
-    fi
-
-    # 修复 ICMP（ping），这不能保证 ping 结果有效（如 clash 不支持转发 ICMP），仅保证有返回，--to-destination 可设为可达地址
-    if [[ "${bin_name}" == @(mihomo|sing-box) ]]; then
-      if [ -n "${fake_ip_range}" ]; then
-        ensure_rule_insert nat OUTPUT -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
-        ensure_rule_insert nat PREROUTING -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
-      fi
-    fi
-  fi
+  ensure_dns_nat_hijack
+  setup_fake_ip_icmp_rules
 }
 
 stop_tproxy() {
-  if [ "${iptables}" = "$IPV" ]; then
-    del_ip_rule_if_exists ip "${fwmark}" "${table}" "${pref}"
-    del_ip_route_local_default_if_exists ip "${table}"
-    ip route flush table "${table}" >/dev/null 2>&1 || true
-    ip rule del pref "${pref}" >/dev/null 2>&1 || true
-  else
-    del_ip_rule_if_exists "ip -6" "${fwmark}" "${table}" "${pref}"
-    del_ip_route_local_default_if_exists "ip -6" "${table}"
-    ip -6 route flush table "${table}" >/dev/null 2>&1 || true
-    ip -6 rule del pref "${pref}" >/dev/null 2>&1 || true
-  fi
+  cleanup_tproxy_policy_routing
 
-  del_jump_silent mangle PREROUTING BOX_EXTERNAL
-  del_jump_silent mangle OUTPUT BOX_LOCAL
-  del_rule_silent mangle PREROUTING -p tcp -m socket -j DIVERT
+  cleanup_external_chain_common mangle BOX_EXTERNAL
+  cleanup_local_chain_common mangle BOX_LOCAL
+  cleanup_perf_chains mangle \
+    "$(tproxy_perf_pre_ip_chain)" \
+    "$(tproxy_perf_pre_if_chain)" \
+    "$(tproxy_perf_out_ip_chain)" \
+    "$(tproxy_perf_out_app_chain)"
 
-  cleanup_chain_fast mangle BOX_EXTERNAL
-  cleanup_chain_fast mangle BOX_LOCAL
+  cleanup_tproxy_divert_chain
+
+  cleanup_quic_block_rules
+
+  cleanup_loopback_reject_rule "${tproxy_port}"
 
   if [ "${iptables}" = "$IPV" ]; then
-    cleanup_chain_fast mangle LOCAL_IP_V4
-  else
-    cleanup_chain_fast mangle LOCAL_IP_V6
+    cleanup_legacy_mihomo_dns_chains
+    cleanup_fake_ip_icmp_rules
   fi
+  cleanup_dns_nat_hijack_chains
+}
 
-  cleanup_chain_fast mangle DIVERT
+cleanup_iptables_family() {
+  stop_redirect
+  stop_tproxy
+  stop_tun_bypass
+  forward -D
 
-  # 清理 QUIC
-  del_rule_silent filter OUTPUT -p udp -m multiport --dport 443,80 -j REJECT
-  del_rule_silent filter OUTPUT -p udp --dport 443 -j REJECT
-  del_rule_silent filter OUTPUT -p udp --dport 80 -j REJECT
-
-  if [ "${iptables}" = "$IPV" ]; then
-    del_rule_silent filter OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
-    del_rule_silent filter OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner 0 --gid-owner 3005 -m tcp --dport "${tproxy_port}" -j REJECT
-  else
-    del_rule_silent filter OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
-    del_rule_silent filter OUTPUT -d ::1 -p tcp -m owner --uid-owner 0 --gid-owner 3005 -m tcp --dport "${tproxy_port}" -j REJECT
-  fi
-
-  if [ "${iptables}" = "$IPV" ]; then
-    del_jump_silent nat PREROUTING MIHOMO_DNS_EXTERNAL
-    del_jump_silent nat OUTPUT MIHOMO_DNS_LOCAL
-    cleanup_chain_fast nat MIHOMO_DNS_EXTERNAL
-    cleanup_chain_fast nat MIHOMO_DNS_LOCAL
-
-    # 清理自定义 NAT DNS 劫持链（当 dns_hijack_mode=redirect 时创建）
-    del_jump_silent nat PREROUTING NAT_DNS_HIJACK
-    del_jump_silent nat OUTPUT NAT_DNS_HIJACK
-    cleanup_chain_fast nat NAT_DNS_HIJACK
-
-    if [ -n "${fake_ip_range}" ]; then
-      del_rule_silent nat OUTPUT -p icmp -d "${fake_ip_range}" -j DNAT --to-destination 127.0.0.1
-      del_rule_silent nat PREROUTING -p icmp -d "${fake_ip_range}" -j DNAT --to-destination 127.0.0.1
-      del_rule_silent nat OUTPUT -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
-      del_rule_silent nat PREROUTING -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
-    fi
-  fi
   if [ "${iptables}" = "$IP6V" ]; then
-    # 清理 IPv6 NAT DNS 劫持链（如存在）
-    del_jump_silent nat PREROUTING NAT_DNS_HIJACK6
-    del_jump_silent nat OUTPUT NAT_DNS_HIJACK6
-    cleanup_chain_fast nat NAT_DNS_HIJACK6
+    del_rule_if_exists filter OUTPUT -p udp --destination-port 53 -j DROP
   fi
 }
 
 cleanup_iptables() {
   for iptables in "$IPV" "$IP6V"; do
-    iptables="${iptables}" && {
-      stop_redirect
-      stop_tproxy
-      forward -D
-    } > /dev/null 2>&1
-
-    if [ "${iptables}" = "$IP6V" ]; then
-      del_rule_if_exists filter OUTPUT -p udp --destination-port 53 -j DROP
-    fi
+    iptables="${iptables}" && cleanup_iptables_family > /dev/null 2>&1
   done
+}
+
+setup_cn_ipset_if_needed() {
+  if [ "${bypass_cn_ip}" = "true" ]; then
+    setup_cn_ipset || log Warning "大陆IP分流初始化失败，已跳过"
+  fi
+}
+
+cleanup_cn_ipset_if_needed() {
+  if [ "${bypass_cn_ip}" = "true" ]; then
+    cleanup_cn_ipset
+  fi
+}
+
+wait_tun_ready() {
+  if wait_tun_device 12 1; then
+    log Debug "检测到 TUN 设备: (${tun_device})"
+  else
+    log Warning "未在 12 秒内检测到 TUN 设备: (${tun_device})，继续下发规则（可能为初始化时序）"
+  fi
+}
+
+prepare_rule_apply() {
+  probe_user_group || {
+    log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
+  }
+  prepare_cnip_force_proxy_uids
+  log_iptables_results
+  cleanup_iptables
+}
+
+apply_redirect_family() {
+  if start_redirect; then
+    log Info "${iptables} 透明代理规则创建完成。"
+  else
+    log Error "${iptables} 透明代理规则创建失败。"
+    stop_redirect > /dev/null 2>&1
+  fi
+}
+
+apply_tproxy_family() {
+  if start_tproxy; then
+    log Info "${iptables} 透明代理规则创建完成。"
+  else
+    log Error "${iptables} 透明代理规则创建失败。"
+    stop_tproxy > /dev/null 2>&1
+  fi
+}
+
+apply_mixed_family() {
+  forward -I || forward -D > /dev/null 2>&1
+  apply_redirect_family
+}
+
+apply_enhance_family() {
+  if start_redirect && start_tproxy; then
+    log Info "${iptables} 透明代理规则创建完成。"
+  else
+    log Error "${iptables} 透明代理规则创建失败。"
+    stop_redirect > /dev/null 2>&1
+    stop_tproxy > /dev/null 2>&1
+  fi
+}
+
+apply_tun_family() {
+  if [ "${performance_mode}" = "true" ] && [ "${iptables}" = "$IPV" ]; then
+    log Info "TUN 模式下忽略性能模式"
+  fi
+
+  if forward -I && start_tun_bypass; then
+    log Info "$(tun_bypass_family_label) TUN 规则创建完成。"
+  else
+    log Error "$(tun_bypass_family_label) TUN 规则创建失败。"
+    stop_tun_bypass > /dev/null 2>&1
+    forward -D > /dev/null 2>&1
+  fi
 }
 
 log_iptables_results() {
   [ "${network_mode}" = "tun" ] && return 0
-  log Info "操作: 添加 iptables 规则"
-  log_context
   log Info "代理模式: ${proxy_mode}"
+  log_context
 
   local applied_uids=$(cat "${uid_list}" 2>/dev/null | tr '\n' ' ')
-
-  if [ -n "$applied_uids" ]; then
-    log Debug "应用的 UIDs: $applied_uids"
-  else
-    if [[ "$proxy_mode" == "core" ]]; then
-      log Debug "(核心模式, 所有应用透明代理)"
-    elif [[ "$proxy_mode" == "whitelist" || "$proxy_mode" == "white" ]]; then
-      log Debug "(列表为空, 代理所有应用)"
-    else
-      log Debug "(列表为空, 不代理任何应用)"
-    fi
-  fi
-}
-
-log_iptables_cleanup() {
-  log Info "操作: 清理 iptables 规则"
-  log_context
+  [ -n "$applied_uids" ] && log Debug "UID 列表: ${applied_uids}"
 }
 
 if [ "$1" = "disable" ]; then
@@ -1280,137 +2200,79 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
     enable|renew)
       apply_capability_downgrades
       box_etc
-      log Info "$IPV + $IP6V"
-      probe_user_group || {
-        log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
-      }
-      log_iptables_results
-      cleanup_iptables
-
-      # 准备大陆 IP 分流 ipset
-      if [ "${bypass_cn_ip}" = "true" ]; then
-        setup_cn_ipset || log Warning "CN IP 分流初始化失败，已跳过"
-      fi
+      prepare_rule_apply
+      setup_cn_ipset_if_needed
 
       [ $1 = "renew" ] && log Warning "正在清理 iptables 透明代理规则。"
 
       case "${network_mode}" in
         tproxy)
-          log Info "使用 Tproxy: tcp + udp。"
-          log Info "正在创建 iptables 透明代理规则。"
+          log Info "TPROXY: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          if start_tproxy; then
-            log Info "iptables 透明代理规则创建完成。"
-          else
-            log Error "iptables 透明代理规则创建失败。"
-            stop_tproxy > /dev/null 2>&1
-          fi
+          apply_tproxy_family
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-
-            if start_tproxy; then
-              log Info "ip6tables 透明代理规则创建完成。"
-            else
-              log Error "ip6tables 透明代理规则创建失败。"
-              stop_tproxy > /dev/null 2>&1
-            fi
+            apply_tproxy_family
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
           fi
         ;;
         redirect)
-          log Info "使用 Redirect: tcp + udp（直连）。"
-          log Info "正在创建 iptables 透明代理规则。"
+          log Info "Redirect: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          if start_redirect; then
-            log Info "iptables 透明代理规则创建完成。"
-          else
-            log Error "iptables 透明代理规则创建失败。"
-            stop_redirect > /dev/null 2>&1
-          fi
+          apply_redirect_family
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-
-            if start_redirect; then
-              log Info "ip6tables 透明代理规则创建完成。"
-            else
-              log Error "ip6tables 透明代理规则创建失败。"
-              stop_redirect > /dev/null 2>&1
-            fi
+            apply_redirect_family
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
           fi
         ;;
         mixed)
-          log Info "使用 Mixed: tcp(redirect) + udp(tun)。"
-          log Info "正在创建 iptables 透明代理规则。"
+          log Info "Mixed: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          probe_tun_device || log Error "未找到 TUN 设备: (${tun_device})"
-          forward -I || forward -D > /dev/null 2>&1
-
-          if start_redirect; then
-            log Info "iptables 透明代理规则创建完成。"
-          else
-            log Error "iptables 透明代理规则创建失败。"
-            stop_redirect > /dev/null 2>&1
-          fi
+          wait_tun_ready
+          apply_mixed_family
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-            forward -I || forward -D > /dev/null 2>&1
-            if start_redirect; then
-              log Info "ip6tables 透明代理规则创建完成。"
-            else
-              log Error "ip6tables 透明代理规则创建失败。"
-              stop_redirect > /dev/null 2>&1
-            fi
+            apply_mixed_family
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
           fi
         ;;
         enhance)
-          log Info "使用 Enhance: tcp(redirect) + udp(tproxy)"
-          log Info "正在创建 iptables 透明代理规则。"
+          log Info "Enhance: 正在创建透明代理规则。"
 
           iptables="$IPV"
-          if start_redirect && start_tproxy; then
-            log Info "iptables 透明代理规则创建完成。"
-          else
-            log Error "iptables 透明代理规则创建失败。"
-            stop_redirect > /dev/null 2>&1
-          fi
+          apply_enhance_family
 
           if [ "${ipv6}" = "true" ]; then
             log Debug "启用 IPv6。"
             ipv6_enable
             iptables="$IP6V"
-            if start_redirect && start_tproxy; then
-              log Info "ip6tables 透明代理规则创建完成。"
-            else
-              log Error "ip6tables 透明代理规则创建失败。"
-              stop_redirect > /dev/null 2>&1
-            fi
+            apply_enhance_family
           else
             disable_ipv6
             log Warning "已禁用 IPv6。"
           fi
         ;;
         *)
-          log Error "network_mode: ${network_mode}，未知模式"
+          log Error "网络模式: ${network_mode}，未知模式"
           exit 1
         ;;
       esac
@@ -1422,19 +2284,15 @@ if [[ "${network_mode}" == @(redirect|mixed|tproxy|enhance) ]]; then
       runtime_load >/dev/null 2>&1 || true
       ipv6_enable
       probe_user_group || log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
-      log_iptables_cleanup
       log Warning "正在清理 iptables 透明代理规则。"
 
       cleanup_iptables
 
-      # 清理大陆 IP 分流 ipset
-      if [ "${bypass_cn_ip}" = "true" ]; then
-        cleanup_cn_ipset
-      fi
+      cleanup_cn_ipset_if_needed
 
       runtime_clear
 
-      log Warning "iptables 透明代理规则清理完成。"
+      log Info "iptables 透明代理规则清理完成。"
       ;;
     *)
       echo "${red}$0 $1 未知命令${normal}"
@@ -1446,37 +2304,22 @@ else
     enable|renew)
       apply_capability_downgrades
       box_etc
-      log Info "$IPV + $IP6V"
-      log Info "使用 Tun: tcp + udp。"
 
-      probe_user_group || {
-        log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
-      }
-      log_iptables_results
-      cleanup_iptables
-      probe_tun_device || log Error "未找到 TUN 设备: (${tun_device})"
+      prepare_rule_apply
+      setup_cn_ipset_if_needed
+      wait_tun_ready
       [ $1 = "renew" ] && log Warning "正在清理 TUN 规则。"
       iptables="$IPV"
 
       [ -n "${packages_list}" ] && log Debug "代理模式: $proxy_mode (${packages_list[*]})"
 
-      if forward -I; then
-        log Info "iptables TUN 规则创建完成。"
-      else
-        log Error "iptables TUN 规则创建失败。"
-        forward -D > /dev/null 2>&1
-      fi
+      apply_tun_family
 
       if [ "${ipv6}" = "true" ]; then
         log Debug "启用 IPv6。"
         ipv6_enable
         iptables="$IP6V"
-        if forward -I; then
-          log Info "ip6tables TUN 规则创建完成。"
-        else
-          log Error "ip6tables TUN 规则创建失败。"
-          forward -D > /dev/null 2>&1
-        fi
+        apply_tun_family
       else
         disable_ipv6
         log Warning "已禁用 IPv6。"
@@ -1490,14 +2333,14 @@ else
       runtime_load >/dev/null 2>&1 || true
       ipv6_enable
       probe_user_group || log Error "检测 BOX 用户组失败，请确保 ${bin_name} 内核已启动。"
-      log_iptables_cleanup
       log Warning "正在清理 TUN 规则。"
 
       cleanup_iptables
+      cleanup_cn_ipset_if_needed
 
       runtime_clear
 
-      log Warning "TUN 规则清理完成。"
+      log Info "TUN 规则清理完成。"
       ;;
     *)
       echo "${red}$0: '$1' 未知命令${normal}"
