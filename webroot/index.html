@@ -1,5 +1,27 @@
-<!DOCTYPE html>
-<script>
-    document.location = 'http://127.0.0.1:9090/ui/'
-</script>
+<!doctype html>
+<html>
+	<head>
+		<meta charset="UTF-8" />
+		<title>Proxy</title>
+		<style>
+			* {
+				margin: 0;
+				padding: 0;
+				box-sizing: border-box;
+			}
+			html,
+			body {
+				height: 100%;
+				overflow: hidden;
+			}
+			iframe {
+				width: 100%;
+				height: 100%;
+				border: none;
+			}
+		</style>
+	</head>
+	<body>
+		<iframe src="http://127.0.0.1:9090/ui"></iframe>
+	</body>
 </html>
