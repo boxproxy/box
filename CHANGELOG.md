@@ -1,3 +1,8 @@
+#### Changelog 1.2.7 - 04-04-2026
+- 重构网络与 iptables 规则框架，增强 TProxy/IPv6 与网络匹配稳定性
+- 新增 CNIP（ipset）分流能力，并提供 upcnip 更新命令
+- 安装恢复流程补充 gid.list.cfg
+
 #### Changelog 1.2.6 - 06-11-2025
 - 优化 WebUI 不再是固定 dashboard 目录
 - 为模块安装新增删除更新残留选项，新增超时自动选择
