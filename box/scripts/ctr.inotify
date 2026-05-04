@@ -41,6 +41,10 @@ check_stability_window() {
   [ -f "$STATE_FILE" ] && last=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
   
   if [ $((current - last)) -lt $STABILITY_WINDOW ]; then
+    if [ "$(/system/bin/settings get global airplane_mode_on 2>/dev/null | tr -d '[:space:]')" = "1" ]; then
+      echo "$current" > "$STATE_FILE"
+      return 0
+    fi
     log_msg "跳过: 稳定窗口内 ($((current - last))秒)"
     exit 0
   fi
@@ -89,7 +93,14 @@ save_wifi_state() {
 main() {
   clean_old_logs
   check_stability_window
-  
+
+  if [ "$(/system/bin/settings get global airplane_mode_on 2>/dev/null | tr -d '[:space:]')" = "1" ]; then
+    log_msg "飞行模式已开启，停止服务"
+    stop_service
+    log_msg "完成"
+    exit 0
+  fi
+
   local wifi_status=$(is_wifi_connected)
   local ssid=$(get_current_ssid)
   local bssid=$(get_current_bssid)
