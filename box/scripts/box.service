@@ -752,6 +752,21 @@ prepare_mihomo() {
     printf "\nredir-port: ${redir_port}" >> "${mihomo_config}"
   fi
 
+  # 检测 tun 配置格式（顶层 tun: 或 listeners 中的 type: tun）
+  mihomo_tun_status=$(busybox awk '!/^ *#/ && /tun:/ { getline; split($0, arr, ": "); print arr[2]; found=1; exit } END{ if (!found) print "" }' "${mihomo_config}" 2>/dev/null)
+  mihomo_use_listeners_format="false"
+  if [ -z "${mihomo_tun_status}" ]; then
+    mihomo_has_tun_listener=$(busybox awk '
+      /^listeners:/ { in_listeners=1; next }
+      in_listeners && /^[a-zA-Z]/ { in_listeners=0 }
+      in_listeners && /^[[:space:]]*type:[[:space:]]*tun/ { print "true"; found=1; exit }
+      END { if (!found) print "" }
+    ' "${mihomo_config}" 2>/dev/null)
+    if [ -n "${mihomo_has_tun_listener}" ]; then
+      mihomo_use_listeners_format="true"
+    fi
+  fi
+
   if [[ "${network_mode}" == @(mixed|tun) ]]; then
     # 当 TUN + CNIP 由 box.iptables 接管策略路由时，这里只同步 tun 开关，不再让 Mihomo 自动写路由。
     local mihomo_tun_auto_route
@@ -768,9 +783,44 @@ prepare_mihomo() {
     if tun_should_force_gvisor; then
       log Info "检测到 TUN + 大陆IP分流，已将 mihomo 协议栈调整为 gvisor。"
     fi
-    mihomo_tun_status=$(busybox awk '!/^ *#/ && /tun:/ { getline; split($0, arr, ": "); print arr[2]; found=1; exit } END{ if (!found) print "" }' "${mihomo_config}" 2>/dev/null)
+    if [ "${mihomo_use_listeners_format}" = "true" ]; then
+      # 切换回 tun/mixed 模式时，恢复之前可能被注释的 listeners tun 条目
+      busybox awk '
+        /^listeners:/ { in_listeners = 1; print; next }
+        in_listeners && /^[a-zA-Z]/ && !/^[[:space:]]/ {
+          flush_entry()
+          in_listeners = 0
+          print
+          next
+        }
+        in_listeners {
+          if (/^[[:space:]]*#?[[:space:]]*-[[:space:]]/) {
+            flush_entry()
+          }
+          entry_buf = entry_buf $0 "\n"
+          if (/type:[[:space:]]*tun/ || /#[[:space:]]*type:[[:space:]]*tun/) { is_tun = 1 }
+          next
+        }
+        { print }
+        function flush_entry() {
+          if (entry_buf == "") { return }
+          if (is_tun) {
+            n = split(entry_buf, lines, "\n")
+            for (i = 1; i < n; i++) {
+              sub(/^[[:space:]]*#/, "", lines[i])
+              print lines[i]
+            }
+          } else {
+            printf "%s", entry_buf
+          }
+          entry_buf = ""; is_tun = 0
+        }
+        END { flush_entry() }
+      ' "${mihomo_config}" > "${mihomo_config}.tmp" && mv "${mihomo_config}.tmp" "${mihomo_config}"
+      log Info "已恢复 ${mihomo_config} listeners 中的 type: tun 条目"
+    fi
     # 写入 TUN 配置，如未配置
-    if [ -z "${mihomo_tun_status}" ]; then
+    if [ -z "${mihomo_tun_status}" ] && [ "${mihomo_use_listeners_format}" != "true" ]; then
       printf '%s\n' '' 'tun:' \
         '  enable: true' \
         '  mtu: 9000' \
@@ -840,7 +890,43 @@ prepare_mihomo() {
     fi
 
   else
-    sed -i "/tun:/,/enable:/ { /enable: true/ s/enable: true/enable: false/ }" "${mihomo_config}"
+    if [ "${mihomo_use_listeners_format}" = "true" ]; then
+      # listeners 格式无 enable 选项，注释掉整个 type: tun 条目
+      busybox awk '
+        /^listeners:/ { in_listeners = 1; print; next }
+        in_listeners && /^[a-zA-Z]/ && !/^[[:space:]]/ {
+          # 遇到下一个顶级 key（如 dns:），刷新最后一个条目后退出 listeners 模式
+          flush_entry()
+          in_listeners = 0
+          print
+          next
+        }
+        in_listeners {
+          if (/^[[:space:]]*-[[:space:]]/) {
+            # 新条目开始，刷新上一个条目
+            flush_entry()
+          }
+          entry_buf = entry_buf $0 "\n"
+          if (/type:[[:space:]]*tun/) { is_tun = 1 }
+          next
+        }
+        { print }
+        function flush_entry() {
+          if (entry_buf == "") { return }
+          if (is_tun) {
+            n = split(entry_buf, lines, "\n")
+            for (i = 1; i < n; i++) printf "#%s\n", lines[i]
+          } else {
+            printf "%s", entry_buf
+          }
+          entry_buf = ""; is_tun = 0
+        }
+        END { flush_entry() }
+      ' "${mihomo_config}" > "${mihomo_config}.tmp" && mv "${mihomo_config}.tmp" "${mihomo_config}"
+      log Info "已注释 ${mihomo_config} listeners 中的 type: tun 条目"
+    else
+      sed -i "/tun:/,/enable:/ { /enable: true/ s/enable: true/enable: false/ }" "${mihomo_config}"
+    fi
   fi
 
   # 同步 tproxy/redir 端口
