@@ -120,7 +120,7 @@ log_service_results() {
     local proxy_mode_type="$2"
     local uids="$3"
 
-    log Info "更新TUN模式UID列表: 模式=${proxy_mode_type}"
+    log Info "更新 ${core_name} UID 列表: 模式=${proxy_mode_type}"
     [ -n "$uids" ] && log Debug "UIDs: ${uids}"
 }
 
@@ -651,6 +651,62 @@ sing_apply_tun_uid_filters() {
   "${yq_bin}" eval "${yq_filter}" -i --output-format=json "${sing_work_config}" > /dev/null 2>&1
 }
 
+ebpf_uid_filter_mode() {
+  case "${proxy_mode}" in
+    whitelist|white)
+      printf '%s\n' "include"
+      ;;
+    blacklist|black)
+      printf '%s\n' "exclude"
+      ;;
+  esac
+}
+
+ebpf_uid_values() {
+  [ -s "${uid_list}" ] || return 0
+  busybox tr '\n' ',' < "${uid_list}" | sed 's/,$//'
+}
+
+sing_prepare_ebpf_inbound() {
+  local yq_bin="$1"
+  local redirect_addresses uid_mode uid_values
+
+  if [ "${proxy_tcp}" != "true" ] && [ "${proxy_udp}" != "true" ]; then
+    log Error "eBPF 运行模式至少需要启用 TCP 或 UDP 代理"
+    set_description error "eBPF 需要启用 TCP 或 UDP 代理"
+    sing_cleanup_work_config
+    exit 1
+  fi
+
+  redirect_addresses='["127.128.0.0/9"]'
+  [ "${ipv6}" = "true" ] && redirect_addresses='["127.128.0.0/9", "fd53:696e:672d:626f::/64"]'
+
+  "${yq_bin}" '.inbounds //= [] | if ([.inbounds[] | select(.type == "ebpf")] | length) == 0 then .inbounds += [{"type": "ebpf", "tag": "ebpf-in"}] else . end' -i --output-format=json "${sing_work_config}"
+  "${yq_bin}" '(.inbounds[] | select(.type == "ebpf")) |= (.tag = "ebpf-in" | del(.include_uid, .exclude_uid, .include_uid_range, .exclude_uid_range, .listen, .listen_port, .bind_interface))' -i --output-format=json "${sing_work_config}"
+  "${yq_bin}" '(.inbounds[] | select(.type == "ebpf")) |= (if has("redirect_address") and .redirect_address != null then . else .redirect_address = '"${redirect_addresses}"' end)' -i --output-format=json "${sing_work_config}"
+
+  if [ "${ipv6}" != "true" ]; then
+    "${yq_bin}" '(.inbounds[] | select(.type == "ebpf") | .redirect_address) |= (map(select(test(":") | not)) | if length == 0 then ["127.128.0.0/9"] else . end)' -i --output-format=json "${sing_work_config}"
+  fi
+
+  if [ "${proxy_tcp}" = "true" ] && [ "${proxy_udp}" = "true" ]; then
+    "${yq_bin}" 'del(.inbounds[] | select(.type == "ebpf") | .network)' -i --output-format=json "${sing_work_config}"
+  elif [ "${proxy_tcp}" = "true" ]; then
+    "${yq_bin}" '(.inbounds[] | select(.type == "ebpf") | .network) = "tcp"' -i --output-format=json "${sing_work_config}"
+  else
+    "${yq_bin}" '(.inbounds[] | select(.type == "ebpf") | .network) = "udp"' -i --output-format=json "${sing_work_config}"
+  fi
+
+  uid_mode="$(ebpf_uid_filter_mode)"
+  uid_values="$(ebpf_uid_values)"
+  if [ -n "${uid_mode}" ] && [ -n "${uid_values}" ]; then
+    "${yq_bin}" "(.inbounds[] | select(.type == \"ebpf\") | .${uid_mode}_uid) = [${uid_values}]" -i --output-format=json "${sing_work_config}"
+    log_service_results "sing-box" "${uid_mode}" "${uid_values}"
+  else
+    log_service_results "sing-box" "core" ""
+  fi
+}
+
 sing_validate_and_commit_work_config() {
   if [ "${sing_is_jsonc}" = "true" ]; then
     if ! restore_json_comments_file "${sing_work_config}" "${sing_comments_file}"; then
@@ -694,10 +750,17 @@ prepare_singbox() {
   yq="yq"
   if ! command -v yq >/dev/null 2>&1; then
     if [ ! -x "${box_dir}/bin/yq" ]; then
-      log Debug "未找到 yq，开始从 GitHub 下载"
-      "${scripts_dir}/box.tool" upyq
+      log Debug "未找到 yq，开始从 GitHub 下载" >&2
+      "${scripts_dir}/box.tool" upyq >/dev/null 2>&1
     fi
     yq="${box_dir}/bin/yq"
+  fi
+
+  sing_prepare_work_config "${yq}"
+  if [ "${network_mode}" = "ebpf" ]; then
+    sing_prepare_ebpf_inbound "${yq}"
+    sing_validate_and_commit_work_config
+    return 0
   fi
 
   # 当 TUN + CNIP 由 box.iptables 接管策略路由时，这里只保留 TUN 入站，不再让内核自动写路由。
@@ -716,7 +779,7 @@ prepare_singbox() {
     log Info "检测到 TUN + 大陆IP分流，已将 sing-box 协议栈调整为 gvisor。"
   fi
 
-  sing_prepare_work_config "${yq}"
+  sing_delete_inbound "${yq}" "ebpf"
   if tun_should_manage_core_config; then
     sing_set_route_auto_detect "${yq}" "${tun_auto_detect_interface}"
     sing_set_tun_flags "${yq}" "${tun_auto_route}" "${tun_strict_route}" "${tun_auto_redirect}"
@@ -793,6 +856,57 @@ EOF
   sing_validate_and_commit_work_config
 }
 
+mihomo_yq_binary() {
+  local yq_bin="yq"
+
+  if ! command -v "${yq_bin}" >/dev/null 2>&1; then
+    if [ ! -x "${box_dir}/bin/yq" ]; then
+      log Debug "未找到 yq，开始从 GitHub 下载" >&2
+      "${scripts_dir}/box.tool" upyq >/dev/null 2>&1
+    fi
+    yq_bin="${box_dir}/bin/yq"
+  fi
+
+  if [ ! -x "${yq_bin}" ] && ! command -v "${yq_bin}" >/dev/null 2>&1; then
+    log Error "未找到 yq，无法覆写 Mihomo eBPF 配置" >&2
+    set_description error "未找到 yq" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${yq_bin}"
+}
+
+mihomo_prepare_ebpf_listener() {
+  local yq_bin="$1"
+  local redirect_addresses uid_mode uid_values
+
+  redirect_addresses='["127.128.0.0/9"]'
+  [ "${ipv6}" = "true" ] && redirect_addresses='["127.128.0.0/9", "fd53:696e:672d:626f::/64"]'
+
+  "${yq_bin}" '.listeners //= [] | if ([.listeners[] | select(.type == "ebpf")] | length) == 0 then .listeners += [{"name": "ebpf-in", "type": "ebpf"}] else . end' -i "${mihomo_config}"
+  "${yq_bin}" '(.listeners[] | select(.type == "ebpf")) |= (.name = "ebpf-in" | del(."include-uid", ."exclude-uid"))' -i "${mihomo_config}"
+  "${yq_bin}" '(.listeners[] | select(.type == "ebpf")) |= (if has("redirect-address") and ."redirect-address" != null then . else ."redirect-address" = '"${redirect_addresses}"' end)' -i "${mihomo_config}"
+
+  if [ "${ipv6}" != "true" ]; then
+    "${yq_bin}" '(.listeners[] | select(.type == "ebpf") | ."redirect-address") |= (map(select(test(":") | not)) | if length == 0 then ["127.128.0.0/9"] else . end)' -i "${mihomo_config}"
+  fi
+
+  uid_mode="$(ebpf_uid_filter_mode)"
+  uid_values="$(ebpf_uid_values)"
+  if [ -n "${uid_mode}" ] && [ -n "${uid_values}" ]; then
+    "${yq_bin}" "(.listeners[] | select(.type == \"ebpf\") | .\"${uid_mode}-uid\") = [${uid_values}]" -i "${mihomo_config}"
+    log_service_results "mihomo" "${uid_mode}" "${uid_values}"
+  else
+    log_service_results "mihomo" "core" ""
+  fi
+}
+
+mihomo_remove_ebpf_listener() {
+  local yq_bin="$1"
+
+  "${yq_bin}" 'if (.listeners | type) == "!!seq" then .listeners |= map(select(.name != "ebpf-in")) else . end' -i "${mihomo_config}"
+}
+
 prepare_mihomo() {
   # 检查配置文件
   if ! [ -f "${mihomo_config}" ]; then
@@ -804,6 +918,19 @@ prepare_mihomo() {
   fi
 
   # 写入 external_controller，如未配置
+  if [ "${network_mode}" = "ebpf" ]; then
+    local yq_bin
+    yq_bin="$(mihomo_yq_binary)"
+    mihomo_prepare_ebpf_listener "${yq_bin}"
+    return 0
+  fi
+
+  if busybox grep -qE '^[[:space:]]*name:[[:space:]]*ebpf-in([[:space:]]*(#.*)?)?$' "${mihomo_config}"; then
+    local yq_bin
+    yq_bin="$(mihomo_yq_binary)"
+    mihomo_remove_ebpf_listener "${yq_bin}"
+  fi
+
   mihomo_external_controller=$(busybox awk '!/^ *#/ && /external-controller: /{print $1}' "${mihomo_config}")
   if [ -z "${mihomo_external_controller}" ]; then
     printf "\nexternal-controller: 0.0.0.0:9090" >> "${mihomo_config}"

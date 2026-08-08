@@ -2972,6 +2972,9 @@ cleanup_iptables_family() {
       stop_tun_bypass
       forward -D
       ;;
+    ebpf)
+      return 0
+      ;;
     all|*)
       stop_redirect
       stop_tproxy
@@ -3108,6 +3111,36 @@ if [ "$1" = "disable" ]; then
   if runtime_load >/dev/null 2>&1; then
     runtime_loaded="true"
   fi
+fi
+
+if [ "${network_mode}" = "ebpf" ] && [[ "${bin_name}" == @(mihomo|sing-box) ]]; then
+  case "$1" in
+    enable|renew)
+      cleanup_mode="$(cleanup_mode_for_apply)"
+      log Debug "eBPF 模式跳过 iptables、策略路由、CNIP 与模块 BPF 匹配规则，清理模式: ${cleanup_mode}"
+      cleanup_iptables_for_mode "${cleanup_mode}"
+      if [ "${cleanup_mode}" != "none" ] && [ "${cleanup_mode}" != "ebpf" ]; then
+        cleanup_rule_ebpf
+      fi
+      runtime_save
+      bin_alive && log Info "${bin_name} eBPF 运行模式已连接"
+      ;;
+    disable)
+      cleanup_mode="all"
+      [ "${runtime_loaded}" = "true" ] && cleanup_mode="${network_mode:-all}"
+      if [ "${cleanup_mode}" != "ebpf" ]; then
+        cleanup_iptables_for_mode "${cleanup_mode}"
+        cleanup_rule_ebpf
+      fi
+      runtime_clear
+      log Info "eBPF 模式不创建网络规则，运行状态已清理"
+      ;;
+    *)
+      echo "${red}$0 $1 未知命令${normal}"
+      echo "${yellow}用法:${normal} ${green}$0${normal} {${yellow}enable|disable|renew${normal}}"
+      ;;
+  esac
+  exit 0
 fi
 
 probe_capabilities
