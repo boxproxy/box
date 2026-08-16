@@ -669,7 +669,7 @@ ebpf_uid_values() {
 
 sing_prepare_ebpf_inbound() {
   local yq_bin="$1"
-  local redirect_addresses uid_mode uid_values
+  local uid_mode uid_values
 
   if [ "${proxy_tcp}" != "true" ] && [ "${proxy_udp}" != "true" ]; then
     log Error "eBPF 运行模式至少需要启用 TCP 或 UDP 代理"
@@ -678,15 +678,11 @@ sing_prepare_ebpf_inbound() {
     exit 1
   fi
 
-  redirect_addresses='["127.128.0.0/9"]'
-  [ "${ipv6}" = "true" ] && redirect_addresses='["127.128.0.0/9", "fd53:696e:672d:626f::/64"]'
-
   "${yq_bin}" '.inbounds //= [] | if ([.inbounds[] | select(.type == "ebpf")] | length) == 0 then .inbounds += [{"type": "ebpf", "tag": "ebpf-in"}] else . end' -i --output-format=json "${sing_work_config}"
-  "${yq_bin}" '(.inbounds[] | select(.type == "ebpf")) |= (.tag = "ebpf-in" | del(.include_uid, .exclude_uid, .include_uid_range, .exclude_uid_range, .listen, .listen_port, .bind_interface))' -i --output-format=json "${sing_work_config}"
-  "${yq_bin}" '(.inbounds[] | select(.type == "ebpf")) |= (if has("redirect_address") and .redirect_address != null then . else .redirect_address = '"${redirect_addresses}"' end)' -i --output-format=json "${sing_work_config}"
+  "${yq_bin}" '(.inbounds[] | select(.type == "ebpf")) |= (.tag = "ebpf-in" | del(.mode) | .local = (if (.local | type) == "!!map" then .local else {} end) | del(.local.include_uid, .local.exclude_uid))' -i --output-format=json "${sing_work_config}"
 
   if [ "${ipv6}" != "true" ]; then
-    "${yq_bin}" '(.inbounds[] | select(.type == "ebpf") | .redirect_address) |= (map(select(test(":") | not)) | if length == 0 then ["127.128.0.0/9"] else . end)' -i --output-format=json "${sing_work_config}"
+    "${yq_bin}" '(.inbounds[] | select(.type == "ebpf")) |= (.local = (if (.local | type) == "!!map" then .local else {} end) | .local.ipv6_mode = "off")' -i --output-format=json "${sing_work_config}"
   fi
 
   if [ "${proxy_tcp}" = "true" ] && [ "${proxy_udp}" = "true" ]; then
@@ -700,7 +696,7 @@ sing_prepare_ebpf_inbound() {
   uid_mode="$(ebpf_uid_filter_mode)"
   uid_values="$(ebpf_uid_values)"
   if [ -n "${uid_mode}" ] && [ -n "${uid_values}" ]; then
-    "${yq_bin}" "(.inbounds[] | select(.type == \"ebpf\") | .${uid_mode}_uid) = [${uid_values}]" -i --output-format=json "${sing_work_config}"
+    "${yq_bin}" "(.inbounds[] | select(.type == \"ebpf\") | .local.${uid_mode}_uid) = [${uid_values}]" -i --output-format=json "${sing_work_config}"
     log_service_results "sing-box" "${uid_mode}" "${uid_values}"
   else
     log_service_results "sing-box" "core" ""
@@ -878,23 +874,33 @@ mihomo_yq_binary() {
 
 mihomo_prepare_ebpf_listener() {
   local yq_bin="$1"
-  local redirect_addresses uid_mode uid_values
+  local uid_mode uid_values
 
-  redirect_addresses='["127.128.0.0/9"]'
-  [ "${ipv6}" = "true" ] && redirect_addresses='["127.128.0.0/9", "fd53:696e:672d:626f::/64"]'
+  if [ "${proxy_tcp}" != "true" ] && [ "${proxy_udp}" != "true" ]; then
+    log Error "eBPF 运行模式至少需要启用 TCP 或 UDP 代理"
+    set_description error "eBPF 需要启用 TCP 或 UDP 代理"
+    exit 1
+  fi
 
   "${yq_bin}" '.listeners //= [] | if ([.listeners[] | select(.type == "ebpf")] | length) == 0 then .listeners += [{"name": "ebpf-in", "type": "ebpf"}] else . end' -i "${mihomo_config}"
-  "${yq_bin}" '(.listeners[] | select(.type == "ebpf")) |= (.name = "ebpf-in" | del(."include-uid", ."exclude-uid"))' -i "${mihomo_config}"
-  "${yq_bin}" '(.listeners[] | select(.type == "ebpf")) |= (if has("redirect-address") and ."redirect-address" != null then . else ."redirect-address" = '"${redirect_addresses}"' end)' -i "${mihomo_config}"
+  "${yq_bin}" '(.listeners[] | select(.type == "ebpf")) |= (.name = "ebpf-in" | del(.mode) | .local = (if (.local | type) == "!!map" then .local else {} end) | del(.local."include-uid", .local."exclude-uid"))' -i "${mihomo_config}"
 
   if [ "${ipv6}" != "true" ]; then
-    "${yq_bin}" '(.listeners[] | select(.type == "ebpf") | ."redirect-address") |= (map(select(test(":") | not)) | if length == 0 then ["127.128.0.0/9"] else . end)' -i "${mihomo_config}"
+    "${yq_bin}" '(.listeners[] | select(.type == "ebpf") | .local."ipv6-mode") = "off"' -i "${mihomo_config}"
+  fi
+
+  if [ "${proxy_tcp}" = "true" ] && [ "${proxy_udp}" = "true" ]; then
+    "${yq_bin}" 'del(.listeners[] | select(.type == "ebpf") | .network)' -i "${mihomo_config}"
+  elif [ "${proxy_tcp}" = "true" ]; then
+    "${yq_bin}" '(.listeners[] | select(.type == "ebpf") | .network) = ["tcp"]' -i "${mihomo_config}"
+  else
+    "${yq_bin}" '(.listeners[] | select(.type == "ebpf") | .network) = ["udp"]' -i "${mihomo_config}"
   fi
 
   uid_mode="$(ebpf_uid_filter_mode)"
   uid_values="$(ebpf_uid_values)"
   if [ -n "${uid_mode}" ] && [ -n "${uid_values}" ]; then
-    "${yq_bin}" "(.listeners[] | select(.type == \"ebpf\") | .\"${uid_mode}-uid\") = [${uid_values}]" -i "${mihomo_config}"
+    "${yq_bin}" "(.listeners[] | select(.type == \"ebpf\") | .local.\"${uid_mode}-uid\") = [${uid_values}]" -i "${mihomo_config}"
     log_service_results "mihomo" "${uid_mode}" "${uid_values}"
   else
     log_service_results "mihomo" "core" ""
